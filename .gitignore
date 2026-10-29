@@ -2,6 +2,7 @@
 obj/
 build/
 GiraffeGPU
+*.pdb
 *.o
 *.d
 *.a

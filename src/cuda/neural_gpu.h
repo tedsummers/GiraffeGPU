@@ -72,6 +72,8 @@ struct DeviceContext {
 
 class NeuralGPU {
 public:
+    friend struct DeviceContext;
+
     NeuralGPU();
     ~NeuralGPU();
 

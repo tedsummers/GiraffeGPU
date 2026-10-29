@@ -70,6 +70,13 @@ make -j$(nproc)
 
 The compiled binary will be placed at `./GiraffeGPU`.
 
+### Building for Windows (.exe)
+You can cross-compile or build a native Windows 64-bit executable using Zig:
+```bash
+make windows
+```
+The resulting executable is `GiraffeGPU.exe`. It can also be added directly to any Windows Chess GUI (Arena, CuteChess, Fritz, Bankchess, etc.).
+
 ### Build with CMake
 ```bash
 mkdir -p build && cd build

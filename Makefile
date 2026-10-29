@@ -40,6 +40,16 @@ $(TARGET): $(CPP_OBJS) $(CU_OBJS)
 	@echo "============================================="
 
 clean:
-	rm -rf $(OBJ_DIR) $(TARGET)
+	rm -rf $(OBJ_DIR) $(TARGET) $(WIN_TARGET)
 
-.PHONY: all clean
+ZIG ?= $(shell which zig 2>/dev/null || echo /home/linuxbrew/.linuxbrew/bin/zig)
+WIN_TARGET = GiraffeGPU.exe
+
+windows:
+	@echo "Building Windows 64-bit standalone executable ($(WIN_TARGET))..."
+	$(ZIG) c++ -target x86_64-windows-gnu -O3 -std=c++17 -I$(SRC_DIR) -pthread $(CPP_SRCS) -o $(WIN_TARGET)
+	@echo "============================================="
+	@echo "Build successful: ./$(WIN_TARGET)"
+	@echo "============================================="
+
+.PHONY: all clean windows
