@@ -19,7 +19,7 @@ struct SearchLimits {
     int64_t btime = -1;
     int64_t winc = 0;
     int64_t binc = 0;
-    int movestogo = 30;
+    int movestogo = 0;
     bool infinite = false;
 };
 
@@ -63,7 +63,8 @@ private:
     int num_threads_;
     SearchLimits limits_;
     std::chrono::steady_clock::time_point start_time_;
-    int64_t allocated_time_ms_;
+    int64_t target_time_ms_;
+    int64_t hard_limit_ms_;
 
     std::vector<std::thread> helper_threads_;
     SearchWorker main_worker_;

@@ -11,7 +11,8 @@ Search::Search()
     , searching_(false)
     , nodes_(0)
     , num_threads_(2) // Default to 2 threads for dual-GPU acceleration
-    , allocated_time_ms_(-1)
+    , target_time_ms_(-1)
+    , hard_limit_ms_(-1)
 {
     main_worker_.id = 0;
     main_worker_.seldepth = 0;
@@ -38,13 +39,13 @@ void Search::stop() {
 }
 
 bool Search::check_time() {
-    if (stop_flag_.load()) return true;
+    if (stop_flag_.load(std::memory_order_relaxed)) return true;
 
-    if ((nodes_ & 2047) == 0 && allocated_time_ms_ > 0) {
+    if ((nodes_.load(std::memory_order_relaxed) & 1023) == 0 && hard_limit_ms_ > 0) {
         auto now = std::chrono::steady_clock::now();
         int64_t elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time_).count();
-        if (elapsed >= allocated_time_ms_) {
-            stop_flag_.store(true);
+        if (elapsed >= hard_limit_ms_) {
+            stop_flag_.store(true, std::memory_order_relaxed);
             return true;
         }
     }
@@ -288,17 +289,33 @@ void Search::start(Board& board, const SearchLimits& limits) {
     nodes_.store(0);
     start_time_ = std::chrono::steady_clock::now();
 
-    allocated_time_ms_ = -1;
-    if (limits_.movetime > 0) {
-        allocated_time_ms_ = limits_.movetime - 10;
+    target_time_ms_ = -1;
+    hard_limit_ms_ = -1;
+
+    if (limits_.infinite) {
+        // Infinite search: only stops on UCI 'stop'
+        target_time_ms_ = -1;
+        hard_limit_ms_ = -1;
+    } else if (limits_.movetime > 0) {
+        // Fixed movetime (e.g., go movetime 3000)
+        // Hard limit buffers 15ms for transmission lag; target buffers 30ms
+        hard_limit_ms_ = std::max(int64_t(10), limits_.movetime - 15);
+        target_time_ms_ = std::max(int64_t(10), limits_.movetime - 30);
     } else {
         int64_t my_time = (board.side_to_move() == WHITE) ? limits_.wtime : limits_.btime;
         int64_t my_inc  = (board.side_to_move() == WHITE) ? limits_.winc  : limits_.binc;
+
         if (my_time > 0) {
-            int moves_left = std::max(10, limits_.movestogo);
-            allocated_time_ms_ = (my_time / moves_left) + (my_inc * 3 / 4);
-            allocated_time_ms_ = std::min(allocated_time_ms_, my_time - 50);
-            if (allocated_time_ms_ < 10) allocated_time_ms_ = 10;
+            int moves_left = (limits_.movestogo > 0) ? std::min(limits_.movestogo, 50) : 30;
+            // Target time: portion of remaining clock + 80% increment
+            int64_t target = (my_time / moves_left) + (my_inc * 4 / 5);
+
+            // Hard limit: max time allowed before risking flagging
+            int64_t max_allowed = std::min(static_cast<int64_t>(my_time * 0.4), my_time - 50);
+            int64_t hard = std::min(target * 3, max_allowed);
+
+            target_time_ms_ = std::max(int64_t(10), target);
+            hard_limit_ms_ = std::max(target_time_ms_, hard);
         }
     }
 
@@ -340,7 +357,12 @@ void Search::search_root(Board& board) {
     }
     best_move = root_moves[0];
 
+    // If there is only one legal move (forced move) and not playing fixed depth or infinite,
+    // play it immediately after depth 1 to conserve clock time!
+    bool single_reply = (root_moves.size() == 1) && !limits_.infinite && (limits_.depth == 64);
+
     int max_depth = std::min(limits_.depth, 64);
+    int64_t prev_elapsed = 0;
 
     for (int depth = 1; depth <= max_depth; ++depth) {
         Value alpha = -VALUE_INFINITE;
@@ -366,6 +388,9 @@ void Search::search_root(Board& board) {
 
         auto now = std::chrono::steady_clock::now();
         int64_t elapsed_ms = std::max(int64_t(1), std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time_).count());
+        int64_t depth_time = elapsed_ms - prev_elapsed;
+        prev_elapsed = elapsed_ms;
+
         uint64_t current_nodes = nodes_.load();
         uint64_t nps = (current_nodes * 1000) / elapsed_ms;
 
@@ -390,9 +415,23 @@ void Search::search_root(Board& board) {
         }
         std::cout << std::endl;
 
+        if (single_reply && depth >= 1) break;
         if (limits_.nodes > 0 && current_nodes >= static_cast<uint64_t>(limits_.nodes)) break;
-        if (allocated_time_ms_ > 0 && elapsed_ms * 2 >= allocated_time_ms_) break;
         if (std::abs(score) >= VALUE_MATE_THRESHOLD) break;
+
+        // Dynamic time check before deciding to initiate next depth
+        if (target_time_ms_ > 0) {
+            // If we have met or exceeded target thinking time, complete search and play move
+            if (elapsed_ms >= target_time_ms_) break;
+
+            // If depth >= 5 and starting the next depth would likely exceed hard limit
+            // (assuming typical branching factor of ~2.5x to 3.0x):
+            if (hard_limit_ms_ > 0 && depth >= 5) {
+                if (elapsed_ms + (depth_time * 2.2) > hard_limit_ms_) {
+                    break;
+                }
+            }
+        }
     }
 
     std::cout << "bestmove " << best_move.to_uci() << std::endl;
