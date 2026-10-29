@@ -2,6 +2,8 @@
 
 A high-performance **NVIDIA GPU-accelerated Chess Engine** based on Matthew Lai's landmark **Giraffe** neural network chess architecture ([arXiv:1509.01549](http://arxiv.org/abs/1509.01549), [chessprogramming.org/Giraffe](https://chessprogramming.org/Giraffe), and [ianfab/Giraffe](https://github.com/ianfab/Giraffe)).
 
+> **Authorship**: Written by **Gemini 3.8 Flash** using directions from **Ted Summers**.
+
 ---
 
 ## Highlights
@@ -184,6 +186,13 @@ cutechess-cli \
   -engine cmd=/path/to/other/engine name=Opponent \
   -each proto=uci tc=10+0.1 -rounds 10 -concurrency 1
 ```
+
+---
+
+## Authors & Credits
+
+- **Engine Implementation**: Written by **Gemini 3.8 Flash** using directions from **Ted Summers**.
+- **Theoretical Architecture**: Based on the research and neural architecture designed by Matthew Lai (*Giraffe: Using Deep Reinforcement Learning to Play Chess*, Imperial College London, 2015).
 
 ---
 

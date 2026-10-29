@@ -36,6 +36,7 @@ int main(int argc, char* argv[]) {
 
     std::cout << "GiraffeGPU 1.0 (NVIDIA CUDA Neural Chess Engine)" << std::endl;
     std::cout << "Based on Giraffe by Matthew Lai (Imperial College London)" << std::endl;
+    std::cout << "Written by Gemini 3.8 Flash using directions from Ted Summers" << std::endl;
 
     UCI uci;
     uci.loop();

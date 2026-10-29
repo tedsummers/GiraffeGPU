@@ -22,7 +22,7 @@ void UCI::handle_stop() {
 
 void UCI::handle_uci() {
     std::cout << "id name GiraffeGPU 1.0" << std::endl;
-    std::cout << "id author Matthew Lai / Giraffe GPU Team" << std::endl;
+    std::cout << "id author Gemini 3.8 Flash / Ted Summers" << std::endl;
     std::cout << "option name Hash type spin default 64 min 1 max 8192" << std::endl;
     std::cout << "option name Threads type spin default 2 min 1 max 64" << std::endl;
     std::cout << "option name Device_GPU type spin default -1 min -1 max 7" << std::endl;
