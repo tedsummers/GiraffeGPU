@@ -227,27 +227,57 @@ Uses Simultaneous Perturbation Stochastic Approximation to optimize search and p
 python3 testing/run_tests.py --spsa --iters 20 --tc 3+0.05
 ```
 
-### 5. 5-Day Autonomous Self-Improvement System
-Orchestrates an uninterrupted 120-hour self-improvement pipeline across both NVIDIA GPUs:
-- **Day 1**: SPSA search parameter tuning (LMR, Null-Move, Aspiration).
-- **Day 2**: Tactical distillation & opening book refinement.
-- **Day 3–4**: Large-scale dual-GPU self-play & TD-learning neural backprop.
-- **Day 5**: Validation gauntlet, SPRT verification, and binary packaging.
+### 5. 5-Day Autonomous Self-Improvement System (`autonomous_5day.py`)
+
+GiraffeGPU includes a fully automated, 120-hour (5-day) self-improvement daemon that runs 24/7 across both NVIDIA GPUs (RTX 3060 and RTX 5050), progressively training network weights and optimizing search heuristics without requiring human intervention.
+
+#### The 4-Stage Improvement Cycle
+
+```mermaid
+flowchart TD
+    A["Dual-GPU Self-Play\n(Generate ~15,000 games/day with opening randomization)"] --> B["Data Extraction & Replay Buffer\n(Extract 363-dim features + TD(λ) game outcomes)"]
+    B --> C["Neural Network Retraining\n(Gradient descent on eval.net weights)"]
+    C --> D["Automated SPRT Gauntlet\n(Candidate vs Baseline: 100+ games at 3+0.05)"]
+    D -- "PASS (Elo gain confirmed at 95% CI)" --> E["Promote Candidate to Master\n(Update eval.net & recompile binaries)"]
+    D -- "FAIL (No statistical gain)" --> F["Revert & Perturb Parameters\n(SPSA Search Tuning)"]
+    E --> A
+    F --> A
+```
+
+#### 5-Day Progression Schedule
+
+| Day | Focus Area | What the Daemon Executes | Expected Elo Gain |
+| :--- | :--- | :--- | :--- |
+| **Day 1** | **Search Parameter Optimization (SPSA)** | Automated tuning of search heuristics using `tune_spsa.py`: Late Move Reductions (LMR), Null-Move $R$ margins, Aspiration Window size, and Killer/History table weights. | **+40 to +70 Elo** |
+| **Day 2** | **Tactical Distillation & Opening Tuning** | Generate games against reference engines to train the 363-dim network to eliminate opening blunders and tactical oversights. | **+60 to +100 Elo** |
+| **Day 3** | **Large-Scale Dual-GPU Self-Play** | Continuous self-play using both GPUs (~25,000 games) starting from 6–10 ply randomized positions from `testing/books/openings.epd`. | **+50 to +80 Elo** |
+| **Day 4** | **TD($\lambda$) Reinforcement Learning Loop** | Train the 363-feature weights using TD($\lambda$) bootstrapping: blending tree search evaluations with game outcomes ($y = (1-\lambda)V_{\text{search}} + \lambda R_{\text{game}}$). | **+40 to +70 Elo** |
+| **Day 5** | **Grand Match Gauntlet & Packaging** | Run a 200-game match gauntlet, benchmark against `bk.epd` and `tactics.epd`, and compile updated Linux (`GiraffeGPU`) and Windows (`GiraffeGPU.exe`) binaries. | **+20 to +40 Elo** |
+| **Total** | | | **+210 to +360 Elo** |
+
+#### Commands to Run and Monitor
 
 ```bash
-# Launch in background as a daemon:
-python3 testing/autonomous_5day.py --daemon
-# or:
+# 1. Launch in background as a daemon (starts 120-hour continuous run):
 make autonomous-daemon
-
-# Check live progress, current day, games, and promotions:
-python3 testing/autonomous_5day.py --status
 # or:
-make autonomous-status
+python3 testing/autonomous_5day.py --daemon
 
-# Stop the daemon gracefully at any time:
+# 2. Check live status anytime (elapsed time, current day, games, promoted networks):
+make autonomous-status
+# or:
+python3 testing/autonomous_5day.py --status
+
+# 3. Follow real-time log output:
+tail -f testing/results/autonomous.log
+
+# 4. Stop the daemon gracefully anytime (finishes current cycle cleanly):
 python3 testing/autonomous_5day.py --stop
 ```
+
+#### Fault-Tolerance & State Persistence
+- **Resumable**: State is continuously persisted to `testing/results/autonomous_state.json`. If the machine restarts or the process is stopped, running `--daemon` or `--start` will automatically resume exactly where it left off.
+- **Auto-Promotion**: Whenever a candidate network wins an SPRT match at 95% confidence, it is automatically deployed to `eval.net` and both Linux and Windows standalone binaries are updated.
 
 ---
 
