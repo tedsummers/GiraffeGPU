@@ -1,0 +1,14 @@
+# Build artifacts
+obj/
+build/
+GiraffeGPU
+*.o
+*.d
+*.a
+
+# Editor / OS files
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
