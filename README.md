@@ -158,11 +158,14 @@ Launch `./GiraffeGPU` (Linux) or `.\GiraffeGPU.exe` (Windows) directly:
 - `setoption name Threads value <num>` - Sets search worker threads (default `2` to saturate both GPUs concurrently).
 - `setoption name Hash value <MB>` - Sets transposition table size in MB (e.g., `256`).
 - `setoption name BatchSize value <size>` - Sets maximum GPU evaluation batch size.
+- `setoption name Ponder value <true/false>` - Enables or disables pondering on opponent's time (default: `true`).
 - `setoption name WeightsFile value <path>` - Loads custom Giraffe network weights (e.g., `eval.net`).
 - `ucinewgame` - Resets transposition table and board state for a new game.
 - `position startpos [moves e2e4 ...]` - Sets up the board position.
 - `position fen <fen> [moves ...]` - Sets up position from FEN.
-- `go [depth <d>] [movetime <ms>] [wtime <ms> btime <ms> winc <ms> binc <ms>]` - Starts search.
+- `go [depth <d>] [movetime <ms>] [wtime <ms> btime <ms> winc <ms> binc <ms>]` - Starts normal search.
+- `go ponder [wtime <ms> btime <ms> ...]` - Starts pondering on opponent's clock.
+- `ponderhit` - Signals that opponent played the predicted ponder move; seamlessly transitions to normal search.
 - `stop` - Stops search and returns best move immediately.
 - `eval` - Evaluates current position on the GPU and prints centipawns.
 - `perft <depth>` - Performs move generation test.

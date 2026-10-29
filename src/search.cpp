@@ -9,7 +9,9 @@ Search g_search;
 Search::Search()
     : stop_flag_(false)
     , searching_(false)
+    , pondering_(false)
     , nodes_(0)
+    , ponder_enabled_(true)
     , num_threads_(2) // Default to 2 threads for dual-GPU acceleration
     , target_time_ms_(-1)
     , hard_limit_ms_(-1)
@@ -24,6 +26,10 @@ Search::Search()
 
 Search::~Search() {
     stop();
+    for (auto& t : helper_threads_) {
+        if (t.joinable()) t.join();
+    }
+    helper_threads_.clear();
 }
 
 void Search::set_threads(int num_threads) {
@@ -31,15 +37,18 @@ void Search::set_threads(int num_threads) {
 }
 
 void Search::stop() {
-    stop_flag_.store(true);
-    for (auto& t : helper_threads_) {
-        if (t.joinable()) t.join();
-    }
-    helper_threads_.clear();
+    stop_flag_.store(true, std::memory_order_relaxed);
+    pondering_.store(false, std::memory_order_relaxed);
+}
+
+void Search::ponderhit() {
+    pondering_.store(false);
+    start_time_ = std::chrono::steady_clock::now();
 }
 
 bool Search::check_time() {
     if (stop_flag_.load(std::memory_order_relaxed)) return true;
+    if (pondering_.load(std::memory_order_relaxed)) return false; // Never timeout while pondering on opponent's clock
 
     if ((nodes_.load(std::memory_order_relaxed) & 1023) == 0 && hard_limit_ms_ > 0) {
         auto now = std::chrono::steady_clock::now();
@@ -286,6 +295,7 @@ void Search::start(Board& board, const SearchLimits& limits) {
     limits_ = limits;
     stop_flag_.store(false);
     searching_.store(true);
+    pondering_.store(limits_.ponder);
     nodes_.store(0);
     start_time_ = std::chrono::steady_clock::now();
 
@@ -415,24 +425,40 @@ void Search::search_root(Board& board) {
         }
         std::cout << std::endl;
 
-        if (single_reply && depth >= 1) break;
+        if (single_reply && depth >= 1 && !pondering_.load()) break;
         if (limits_.nodes > 0 && current_nodes >= static_cast<uint64_t>(limits_.nodes)) break;
-        if (std::abs(score) >= VALUE_MATE_THRESHOLD) break;
+        if (std::abs(score) >= VALUE_MATE_THRESHOLD && !pondering_.load()) break;
 
         // Dynamic time check before deciding to initiate next depth
-        if (target_time_ms_ > 0) {
-            // If we have met or exceeded target thinking time, complete search and play move
-            if (elapsed_ms >= target_time_ms_) break;
+        if (!pondering_.load(std::memory_order_relaxed)) {
+            if (target_time_ms_ > 0) {
+                // If we have met or exceeded target thinking time, complete search and play move
+                if (elapsed_ms >= target_time_ms_) break;
 
-            // If depth >= 5 and starting the next depth would likely exceed hard limit
-            // (assuming typical branching factor of ~2.5x to 3.0x):
-            if (hard_limit_ms_ > 0 && depth >= 5) {
-                if (elapsed_ms + (depth_time * 2.2) > hard_limit_ms_) {
-                    break;
+                // If depth >= 5 and starting the next depth would likely exceed hard limit
+                // (assuming typical branching factor of ~2.5x to 3.0x):
+                if (hard_limit_ms_ > 0 && depth >= 5) {
+                    if (elapsed_ms + (depth_time * 2.2) > hard_limit_ms_) {
+                        break;
+                    }
                 }
             }
         }
     }
 
-    std::cout << "bestmove " << best_move.to_uci() << std::endl;
+    // Wait if still pondering until ponderhit or stop is received
+    while (pondering_.load(std::memory_order_relaxed) && !stop_flag_.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    Move ponder_move = MOVE_NONE;
+    if (main_worker_.pv_length[0] > 1) {
+        ponder_move = main_worker_.pv_table[0][1];
+    }
+
+    std::cout << "bestmove " << best_move.to_uci();
+    if (ponder_enabled_ && !ponder_move.is_null()) {
+        std::cout << " ponder " << ponder_move.to_uci();
+    }
+    std::cout << std::endl;
 }

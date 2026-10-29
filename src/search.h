@@ -21,6 +21,7 @@ struct SearchLimits {
     int64_t binc = 0;
     int movestogo = 0;
     bool infinite = false;
+    bool ponder = false;
 };
 
 struct SearchWorker {
@@ -42,6 +43,11 @@ public:
 
     void start(Board& board, const SearchLimits& limits);
     void stop();
+    void ponderhit();
+
+    void set_ponder_enabled(bool enabled) { ponder_enabled_ = enabled; }
+    bool is_ponder_enabled() const { return ponder_enabled_; }
+    bool is_pondering() const { return pondering_.load(); }
 
     bool is_searching() const { return searching_.load(); }
     uint64_t nodes_searched() const { return nodes_.load(); }
@@ -58,8 +64,10 @@ private:
 
     std::atomic<bool> stop_flag_;
     std::atomic<bool> searching_;
+    std::atomic<bool> pondering_;
     std::atomic<uint64_t> nodes_;
 
+    bool ponder_enabled_;
     int num_threads_;
     SearchLimits limits_;
     std::chrono::steady_clock::time_point start_time_;

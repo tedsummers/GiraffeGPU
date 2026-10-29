@@ -27,6 +27,7 @@ void UCI::handle_uci() {
     std::cout << "option name Threads type spin default 2 min 1 max 64" << std::endl;
     std::cout << "option name Device_GPU type spin default -1 min -1 max 7" << std::endl;
     std::cout << "option name BatchSize type spin default 512 min 1 max 4096" << std::endl;
+    std::cout << "option name Ponder type check default true" << std::endl;
     std::cout << "option name WeightsFile type string default eval.net" << std::endl;
     std::cout << "uciok" << std::endl;
 }
@@ -76,6 +77,10 @@ void UCI::handle_setoption(const std::string& line) {
             handle_stop();
             Neural::g_neural_gpu.init(Neural::g_neural_gpu.current_device(), bs);
         } catch (...) {}
+    } else if (opt_name == "Ponder") {
+        bool enable = (val_str == "true" || val_str == "1");
+        g_search.set_ponder_enabled(enable);
+        std::cout << "info string Ponder set to " << (enable ? "true" : "false") << std::endl;
     } else if (opt_name == "WeightsFile") {
         if (Neural::g_neural_gpu.load_weights(val_str)) {
             std::cout << "info string Loaded weights from " << val_str << std::endl;
@@ -147,6 +152,8 @@ void UCI::handle_go(const std::string& line) {
             iss >> limits.nodes;
         } else if (token == "infinite") {
             limits.infinite = true;
+        } else if (token == "ponder") {
+            limits.ponder = true;
         }
     }
 
@@ -158,6 +165,10 @@ void UCI::handle_go(const std::string& line) {
     search_thread_ = std::thread([this, limits]() {
         g_search.start(board_, limits);
     });
+}
+
+void UCI::handle_ponderhit() {
+    g_search.ponderhit();
 }
 
 uint64_t UCI::perft(Board& b, int depth) {
@@ -283,6 +294,8 @@ void UCI::loop() {
             handle_go(line);
         } else if (cmd == "stop") {
             handle_stop();
+        } else if (cmd == "ponderhit") {
+            handle_ponderhit();
         } else if (cmd == "quit") {
             handle_stop();
             break;

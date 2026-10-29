@@ -21,6 +21,7 @@ private:
     void handle_position(const std::string& line);
     void handle_go(const std::string& line);
     void handle_stop();
+    void handle_ponderhit();
 
     void handle_perft(int depth);
     void handle_eval();
