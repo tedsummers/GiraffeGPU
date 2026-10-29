@@ -1,6 +1,13 @@
 # GiraffeGPU
 
-A high-performance **NVIDIA GPU-accelerated Chess Engine** based on Matthew Lai's landmark **Giraffe** neural network chess architecture ([arXiv:1509.01549](http://arxiv.org/abs/1509.01549), [chessprogramming.org/Giraffe](https://chessprogramming.org/Giraffe), and [ianfab/Giraffe](https://github.com/ianfab/Giraffe)).
+<p align="center">
+  <img src="assets/Giraffe_Logo.png" alt="GiraffeGPU Logo" width="350"/>
+</p>
+
+<p align="center">
+  <strong>A high-performance NVIDIA GPU-accelerated Chess Engine based on Matthew Lai's Giraffe neural architecture</strong><br/>
+  <em>(<a href="http://arxiv.org/abs/1509.01549">arXiv:1509.01549</a>, <a href="https://chessprogramming.org/Giraffe">chessprogramming.org/Giraffe</a>, and <a href="https://github.com/ianfab/Giraffe">ianfab/Giraffe</a>)</em>
+</p>
 
 > **Authorship**: Written by **Gemini 3.8 Flash** using directions from **Ted Summers**.
 
