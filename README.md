@@ -227,6 +227,28 @@ Uses Simultaneous Perturbation Stochastic Approximation to optimize search and p
 python3 testing/run_tests.py --spsa --iters 20 --tc 3+0.05
 ```
 
+### 5. 5-Day Autonomous Self-Improvement System
+Orchestrates an uninterrupted 120-hour self-improvement pipeline across both NVIDIA GPUs:
+- **Day 1**: SPSA search parameter tuning (LMR, Null-Move, Aspiration).
+- **Day 2**: Tactical distillation & opening book refinement.
+- **Day 3–4**: Large-scale dual-GPU self-play & TD-learning neural backprop.
+- **Day 5**: Validation gauntlet, SPRT verification, and binary packaging.
+
+```bash
+# Launch in background as a daemon:
+python3 testing/autonomous_5day.py --daemon
+# or:
+make autonomous-daemon
+
+# Check live progress, current day, games, and promotions:
+python3 testing/autonomous_5day.py --status
+# or:
+make autonomous-status
+
+# Stop the daemon gracefully at any time:
+python3 testing/autonomous_5day.py --stop
+```
+
 ---
 
 ## Playing with CuteChess

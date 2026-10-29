@@ -61,4 +61,13 @@ test-tactics:
 test-selfplay:
 	python3 testing/run_tests.py --selfplay --games 5 --movetime 50
 
-.PHONY: all clean windows test-epd test-tactics test-selfplay
+autonomous-5day:
+	python3 testing/autonomous_5day.py --start
+
+autonomous-daemon:
+	python3 testing/autonomous_5day.py --daemon
+
+autonomous-status:
+	python3 testing/autonomous_5day.py --status
+
+.PHONY: all clean windows test-epd test-tactics test-selfplay autonomous-5day autonomous-daemon autonomous-status
