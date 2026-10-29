@@ -13,3 +13,7 @@ GiraffeGPU
 *.swp
 *~
 .DS_Store
+
+# Test run outputs
+testing/results/*
+!testing/results/.gitkeep

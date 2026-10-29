@@ -1,0 +1,15 @@
+r1bqkb1r/pppp1ppp/2n5/4p3/2B1n3/5N2/PPPP1PPP/RNBQK2R w KQkq - bm Bxf7+; id "ForkTrick.01";
+r1b1k2r/pppp1ppp/8/4q3/1bP5/2N5/PP1QPPPP/R3KB1R w KQkq - bm a3; id "Pin.01";
+r1bq1rk1/pp3ppp/2n1pn2/2pp4/2PP4/2NBPN2/PP3PPP/R1BQ1RK1 w - - bm dxc5; id "Opening.01";
+8/8/4k3/8/8/4K3/4P3/8 w - - bm Ke4; id "KingPawn.01";
+r1b2rk1/pp1p1ppp/1qn1pn2/8/1bPP4/1PN2N2/PB2BPPP/R2QK2R b KQ - bm Ne4; id "Tactics.01";
+6k1/5ppp/8/8/8/8/5PPP/4R1K1 w - - bm Re8#; id "BackRank.01";
+r2qkb1r/pp2nppp/3p4/2pNN3/2BnP3/3P4/PPP2PPP/R1BbK2R w KQkq - bm Nf6+; id "LégalMate.01";
+r1b1k1nr/pppp1ppp/8/2b1N3/2B1P2q/8/PPPP2PP/RNBQK2R w KQkq - bm g3; id "Defense.01";
+8/2k5/8/8/8/8/1K6/4R3 w - - bm Re6; id "RookCutoff.01";
+r1b2rk1/2q1bppp/p2p1n2/np2p3/4P3/1BN1BN2/PPP2PPP/R2QR1K1 w - - bm Nd5; id "Outpost.01";
+r1bqkb1r/pppp1ppp/2n2n2/4p3/4P3/2N2N2/PPPP1PPP/R1BQKB1R w KQkq - bm d4; id "Scotch.01";
+2r2rk1/1b2bppp/pq2pn2/1p2N3/3P4/P1N5/1P2QPPP/1B1RR1K1 w - - bm Nd7; id "Sacrifice.01";
+rnbqkb1r/pp3ppp/2p1pn2/3p4/2PP4/2N2N2/PP2PPPP/R1BQKB1R w KQkq - bm e3; id "SemiSlav.01";
+8/8/8/8/8/5k2/4p3/4K3 b - - bm Ke3; id "Endgame.Opposition";
+r1bqk2r/pppp1ppp/2n5/1B2p3/4n3/2P2N2/PPP2PPP/R1BQK2R w KQkq - bm Qd5; id "DoubleAttack.01";

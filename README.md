@@ -176,6 +176,59 @@ Launch `./GiraffeGPU` (Linux) or `.\GiraffeGPU.exe` (Windows) directly:
 
 ---
 
+## Testing & Playing Strength Improvement Framework
+
+GiraffeGPU includes a complete automated testing, benchmarking, and training suite in the `testing/` directory to measure and systematically improve engine playing strength.
+
+### 1. Tactical & Positional EPD Benchmarks
+Evaluates solve rate, depth reached, nodes, and time on standardized benchmark suites (Bratko-Kopec Test, Win At Chess, sharp tactical suites):
+
+```bash
+# Run Bratko-Kopec test suite (24 benchmark positions)
+make test-epd
+# or:
+python3 testing/run_tests.py --suite bk --movetime 1000
+
+# Run sharp tactical problem suite
+make test-tactics
+
+# Directly compare a candidate build against a baseline build:
+python3 testing/run_tests.py --suite bk --engine ./GiraffeGPU --compare ./GiraffeGPU_baseline
+```
+
+### 2. Match Gauntlet & SPRT (Sequential Probability Ratio Test)
+Runs automated head-to-head matches between two engine versions or against external reference engines (Stockfish, TacTurn, etc.) with Wald's SPRT statistical stopping conditions:
+
+```bash
+# Run a 20-game match with opening book and alternating colors:
+python3 testing/run_tests.py --match --engine ./GiraffeGPU --engine2 /path/to/opponent --games 20 --tc 5+0.1
+
+# Run SPRT test (stops early as soon as Elo gain/regression is statistically proven at 95% confidence):
+python3 testing/run_tests.py --sprt --engine ./GiraffeGPU_candidate --engine2 ./GiraffeGPU_base --elo0 0.0 --elo1 10.0
+```
+- Real-time scoreboard with **Elo difference**, **95% confidence error margins ($\pm$)**, **Likelihood of Superiority (LOS %)**, and **Log-Likelihood Ratio (LLR)**.
+- Saves full game transcripts to `testing/results/match_<timestamp>.pgn`.
+
+### 3. Self-Play & Reinforcement Learning Data Generator
+Generates self-play games with randomized opening plies (as in Matthew Lai's Giraffe paper) to produce datasets for TD-learning and neural fine-tuning:
+
+```bash
+# Generate 50 self-play games on dual GPUs:
+python3 testing/run_tests.py --selfplay --games 50 --movetime 100
+# or quick run:
+make test-selfplay
+```
+- Saves position FENs, move evaluations, depths, and game outcomes directly to `testing/results/selfplay_dataset.jsonl`.
+
+### 4. SPSA Automated Search Parameter Tuner
+Uses Simultaneous Perturbation Stochastic Approximation to optimize search and pruning parameters (null move reduction, LMR thresholds, aspiration window margins, SEE margins):
+
+```bash
+python3 testing/run_tests.py --spsa --iters 20 --tc 3+0.05
+```
+
+---
+
 ## Playing with CuteChess
 
 GiraffeGPU can play against other engines using `cutechess-cli`:

@@ -52,4 +52,13 @@ windows:
 	@echo "Build successful: ./$(WIN_TARGET)"
 	@echo "============================================="
 
-.PHONY: all clean windows
+test-epd:
+	python3 testing/run_tests.py --suite bk --movetime 1000
+
+test-tactics:
+	python3 testing/run_tests.py --suite tactics --movetime 500
+
+test-selfplay:
+	python3 testing/run_tests.py --selfplay --games 5 --movetime 50
+
+.PHONY: all clean windows test-epd test-tactics test-selfplay
