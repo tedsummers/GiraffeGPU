@@ -11,6 +11,7 @@ public:
     ~UCI();
 
     void loop();
+    void handle_bench(int depth);
 
 private:
     void handle_uci();
@@ -22,7 +23,6 @@ private:
     void handle_stop();
 
     void handle_perft(int depth);
-    void handle_bench(int depth);
     void handle_eval();
     void handle_gpu_info();
 

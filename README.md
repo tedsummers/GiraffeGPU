@@ -55,50 +55,98 @@ GiraffeGPU/
 
 ---
 
-## Building
+## Building and Cross-Platform Support
 
-### Requirements
-- Linux (x86_64)
-- NVIDIA GPU Driver & CUDA Toolkit (`nvcc` 11.0+)
-- C++17 compliant compiler (`g++` 8+)
+GiraffeGPU compiles and runs natively on both **Linux** and **Windows (x86_64)**.
 
-### Build with Make
+---
+
+### 1. Linux Compilation (Native Dual-GPU with CUDA)
+
+#### Prerequisites
+- **OS**: Linux x86_64 (e.g. Arch, Ubuntu, Debian, Fedora)
+- **NVIDIA GPU Driver & CUDA Toolkit**: `nvcc` 11.0+ (tested on CUDA 13.4, SM 8.6 & SM 12.0)
+- **Compiler**: C++17 compliant compiler (`g++` 8+ or `clang++` 7+)
+- **Make** or **CMake** (3.18+)
+
+#### Build with Make (Recommended on Linux)
 ```bash
-cd /home/idiot/Chess/GiraffeGPU
+git clone https://github.com/tedsummers/GiraffeGPU.git
+cd GiraffeGPU
 make -j$(nproc)
 ```
+The compiled binary `./GiraffeGPU` will be generated in the project root.
 
-The compiled binary will be placed at `./GiraffeGPU`.
-
-### Building for Windows (.exe)
-You can cross-compile or build a native Windows 64-bit executable using Zig:
-```bash
-make windows
-```
-The resulting executable is `GiraffeGPU.exe`. It can also be added directly to any Windows Chess GUI (Arena, CuteChess, Fritz, Bankchess, etc.).
-
-### Build with CMake
+#### Build with CMake on Linux
 ```bash
 mkdir -p build && cd build
 cmake ..
 cmake --build . -j$(nproc)
+```
+The executable will be located at `./build/GiraffeGPU`.
+
+---
+
+### 2. Windows Compilation & Precompiled Binary
+
+#### Precompiled Standalone Executable
+A ready-to-run Windows 64-bit standalone executable (`GiraffeGPU.exe`) is included in the root of the repository:
+- **Path**: `GiraffeGPU.exe`
+- Completely self-contained with no external DLL dependencies required.
+- Dynamically loads `nvcuda.dll` when an NVIDIA GPU driver is detected, and features a high-performance vectorized CPU fallback.
+- Works out-of-the-box in Windows Chess GUIs (Arena, Fritz, CuteChess, Bankchess, Lucas Chess).
+
+#### Option A: Cross-Compile for Windows on Linux (via Make & Zig)
+If you are on Linux and want to build the Windows `.exe` binary:
+```bash
+make windows
+```
+*(Uses Zig's built-in cross-compiler `zig c++ -target x86_64-windows-gnu` to produce `GiraffeGPU.exe`).*
+
+#### Option B: Native Windows Build with CMake and Visual Studio (MSVC)
+On a Windows machine with Visual Studio 2019/2022 installed:
+```powershell
+mkdir build
+cd build
+cmake .. -G "Visual Studio 17 2022" -A x64
+cmake --build . --config Release
+```
+The binary will be generated at `build\Release\GiraffeGPU.exe`.
+
+#### Option C: Native Windows Build with MinGW-w64 or Clang
+From a Windows Command Prompt or MSYS2 / PowerShell:
+```powershell
+g++ -O3 -std=c++17 -Isrc -pthread src/*.cpp -o GiraffeGPU.exe
 ```
 
 ---
 
 ## Usage
 
-### Command Line Diagnostics
+### Command Line Diagnostics & Benchmarks
+
+#### Linux:
 ```bash
-# Display detected NVIDIA GPUs and VRAM
+# List detected NVIDIA GPUs, SM architectures, and VRAM:
 ./GiraffeGPU gpu-info
 
-# Run benchmark across standard test positions
+# Run benchmark across standard test positions (depth 5):
 ./GiraffeGPU bench 5
 ```
 
+#### Windows:
+```powershell
+# List detected GPU / accelerator devices:
+.\GiraffeGPU.exe gpu-info
+
+# Run benchmark across standard test positions:
+.\GiraffeGPU.exe bench 5
+```
+
+---
+
 ### UCI Protocol Mode
-Launch `./GiraffeGPU` directly:
+Launch `./GiraffeGPU` (Linux) or `.\GiraffeGPU.exe` (Windows) directly:
 ```bash
 ./GiraffeGPU
 ```

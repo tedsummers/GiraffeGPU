@@ -23,6 +23,14 @@ int main(int argc, char* argv[]) {
                           << ", " << d.totalMemoryMB << " MB VRAM)" << std::endl;
             }
             return 0;
+        } else if (arg == "bench") {
+            int depth = 4;
+            if (argc > 2) {
+                try { depth = std::stoi(argv[2]); } catch (...) { depth = 4; }
+            }
+            UCI uci;
+            uci.handle_bench(depth);
+            return 0;
         }
     }
 
