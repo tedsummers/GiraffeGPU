@@ -50,6 +50,41 @@
 
 ---
 
+## Architecture
+
+```mermaid
+flowchart TD
+    subgraph Input ["Chess Board State"]
+        BB["64-bit Bitboards & Game State"] --> FE["Feature Extractor (363 Giraffe Features)"]
+    end
+
+    subgraph GPU ["NVIDIA CUDA Neural Engine (Dual-Head)"]
+        FE --> L1["Layer 1: 363 -> 512 (ReLU)\nforward_l1_kernel"]
+        L1 --> L2["Layer 2: 512 -> 64 (ReLU)\nforward_l2_kernel"]
+        
+        L2 --> VH["Value Head: 64 -> 1 (Tanh)\nforward_l3_kernel"]
+        L2 --> PH["Policy Head: 64 -> 4096 (Logits)\nforward_policy_kernel"]
+    end
+
+    subgraph Search ["Search & Evaluation Pipeline"]
+        VH --> EV["Position Value (Centipawns)"]
+        PH --> SM["Legal Move Softmax (% Probabilities)"]
+        
+        SM --> MO["Policy-Guided Move Ordering & LMR"]
+        EV --> QS["Quiescence & Leaf Evaluation"]
+        
+        MO --> PVS["PVS Alpha-Beta Search Engine"]
+        QS --> PVS
+        
+        TT["Transposition Table\n(2-Slot Clustered Aging)"] <--> PVS
+        TB["Syzygy Tablebases\n(Fathom 3-4-5-6 Piece)"] <--> PVS
+    end
+
+    PVS --> BM["bestmove (UCI Output)"]
+```
+
+---
+
 ## Directory Structure
 
 ```
