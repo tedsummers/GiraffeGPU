@@ -5,11 +5,14 @@
 #include "board.h"
 #include "tt.h"
 #include "cuda/neural_gpu.h"
+#include "syzygy_tb.h"
 #include <atomic>
 #include <chrono>
 #include <vector>
 #include <thread>
 #include <memory>
+#include <array>
+#include <cstring>
 
 struct SearchLimits {
     int depth = 64;
@@ -24,13 +27,45 @@ struct SearchLimits {
     bool ponder = false;
 };
 
+// Search tables for move ordering: history, countermove, and continuation history
 struct SearchWorker {
     int id;
     int seldepth;
     Move killer_moves[128][2];
+    
+    // Main history: piece -> to_square
     int history[PIECE_NB][64];
+
+    // Countermove table: prev_piece -> prev_to_square -> counter_move
+    Move countermove[PIECE_NB][64];
+
+    // Continuation history (1-ply prior move response):
+    // prev_piece -> prev_to_square -> curr_piece -> curr_to_square
+    int conthist[PIECE_NB][64][64];
+
+    // Move stack for continuation history lookups
+    Move move_stack[128];
+
     Move pv_table[128][128];
     int pv_length[128];
+
+    void clear() {
+        seldepth = 0;
+        for (int i = 0; i < 128; i++) {
+            killer_moves[i][0] = Move();
+            killer_moves[i][1] = Move();
+            move_stack[i] = Move();
+            pv_length[i] = 0;
+            for (int j = 0; j < 128; j++) pv_table[i][j] = Move();
+        }
+        std::memset(history, 0, sizeof(history));
+        for (int p = 0; p < PIECE_NB; p++) {
+            for (int s = 0; s < 64; s++) {
+                countermove[p][s] = Move();
+            }
+        }
+        std::memset(conthist, 0, sizeof(conthist));
+    }
 };
 
 class Search {
@@ -52,6 +87,10 @@ public:
     bool is_searching() const { return searching_.load(); }
     uint64_t nodes_searched() const { return nodes_.load(); }
 
+    void set_syzygy_path(const std::string& path) {
+        Syzygy::init(path);
+    }
+
 private:
     void search_root(Board& board);
     void worker_search(Board board, int worker_id, int max_depth);
@@ -60,6 +99,8 @@ private:
     Value qsearch(Board& board, SearchWorker& w, int ply, Value alpha, Value beta);
 
     void order_moves(const Board& board, const SearchWorker& w, std::vector<Move>& moves, Move tt_move, int ply);
+    void update_quiet_history(SearchWorker& w, const Board& board, Move best_quiet, const std::vector<Move>& quiet_moves, int depth, int ply);
+
     bool check_time();
 
     std::atomic<bool> stop_flag_;

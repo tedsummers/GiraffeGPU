@@ -7,11 +7,14 @@ SRC_DIR = src
 OBJ_DIR = obj
 
 CPP_SRCS = $(wildcard $(SRC_DIR)/*.cpp)
+C_SRCS   = $(SRC_DIR)/syzygy/tbprobe.c
 CU_SRCS  = $(wildcard $(SRC_DIR)/cuda/*.cu)
 
 CPP_OBJS = $(patsubst $(SRC_DIR)/%.cpp, $(OBJ_DIR)/%.o, $(CPP_SRCS))
+C_OBJS   = $(patsubst $(SRC_DIR)/syzygy/%.c, $(OBJ_DIR)/syzygy/%.o, $(C_SRCS))
 CU_OBJS  = $(patsubst $(SRC_DIR)/cuda/%.cu, $(OBJ_DIR)/cuda/%.o, $(CU_SRCS))
 
+CFLAGS   = -O3 -march=native -Wall -Wextra -pthread -I$(SRC_DIR)
 CXXFLAGS = -O3 -march=native -std=c++17 -Wall -Wextra -pthread -I$(SRC_DIR) -I/opt/cuda/include
 NVCCFLAGS = -O3 -std=c++17 -I$(SRC_DIR) -I/opt/cuda/include \
             -gencode arch=compute_86,code=sm_86 \
@@ -26,14 +29,18 @@ all: $(TARGET)
 $(OBJ_DIR):
 	mkdir -p $(OBJ_DIR)
 	mkdir -p $(OBJ_DIR)/cuda
+	mkdir -p $(OBJ_DIR)/syzygy
 
 $(OBJ_DIR)/%.o: $(SRC_DIR)/%.cpp | $(OBJ_DIR)
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
+$(OBJ_DIR)/syzygy/%.o: $(SRC_DIR)/syzygy/%.c | $(OBJ_DIR)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(OBJ_DIR)/cuda/%.o: $(SRC_DIR)/cuda/%.cu | $(OBJ_DIR)
 	$(NVCC) $(NVCCFLAGS) -c $< -o $@
 
-$(TARGET): $(CPP_OBJS) $(CU_OBJS)
+$(TARGET): $(CPP_OBJS) $(C_OBJS) $(CU_OBJS)
 	$(NVCC) $(NVCCFLAGS) $^ -o $@ $(LDFLAGS)
 	@echo "============================================="
 	@echo "Build successful: ./$(TARGET)"
@@ -45,9 +52,10 @@ clean:
 ZIG ?= $(shell which zig 2>/dev/null || echo /home/linuxbrew/.linuxbrew/bin/zig)
 WIN_TARGET = GiraffeGPU.exe
 
-windows:
+windows: $(OBJ_DIR)
 	@echo "Building Windows 64-bit standalone executable ($(WIN_TARGET))..."
-	$(ZIG) c++ -target x86_64-windows-gnu -O3 -std=c++17 -I$(SRC_DIR) -pthread $(CPP_SRCS) -o $(WIN_TARGET)
+	$(ZIG) cc -target x86_64-windows-gnu -O3 -I$(SRC_DIR) -pthread -c $(C_SRCS) -o $(OBJ_DIR)/tbprobe_win.o
+	$(ZIG) c++ -target x86_64-windows-gnu -O3 -std=c++17 -I$(SRC_DIR) -pthread $(CPP_SRCS) $(OBJ_DIR)/tbprobe_win.o -o $(WIN_TARGET)
 	@echo "============================================="
 	@echo "Build successful: ./$(WIN_TARGET)"
 	@echo "============================================="

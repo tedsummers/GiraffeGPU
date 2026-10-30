@@ -73,6 +73,7 @@ public:
     void generate_captures(std::vector<Move>& moves) const;
 
     bool is_legal_move(Move m) const;
+    bool gives_check(Move m) const;
     Move parse_move_uci(const std::string& uci) const;
 
     void print() const;

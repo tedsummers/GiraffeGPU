@@ -29,11 +29,17 @@
 - **Universal Chess Interface (UCI) Protocol**: Compatible with all standard chess GUIs (CuteChess, Arena, Scid vs PC, Nibbler, etc.).
 - **Engine Search Features**:
   - Negamax with Principal Variation Search (PVS)
-  - Iterative Deepening with Aspiration Windows
-  - 64-bit Zobrist Transposition Table (with dynamic sizing & replacement)
-  - Quiescence Search with Static Exchange Evaluation (SEE) pruning
-  - Move ordering with TT move, MVV-LVA, SEE, Killer moves (2 plies), and History heuristic
-  - Null Move Pruning & Late Move Reductions (LMR)
+  - Iterative Deepening with dynamic widening Aspiration Windows (fail-low / fail-high widening)
+  - **2-Slot Clustered Transposition Table**: Depth-preferred slot with aging demotion and Always-replace/Age-preferred slot, with 32-bit key verification and 16-byte cache alignment.
+  - **History Gravity**: Dynamic positive bonus and negative malus decay formula (`score += bonus - (score * |bonus|)/16384`) capped at $\pm 16384$.
+  - **Continuation History**: 1-ply piece-to-square continuation history (`conthist[piece][from][to]`) tracking responses to the opponent's previous move.
+  - **Countermove Heuristic**: 2D lookup table (`countermove[piece][to]`) prioritizing specific refutations to the previous move on quiet cutoffs.
+  - **ProbCut Pruning**: At depth $\ge 5$, probes shallow capture searches against an aggressive $\beta + 180$ threshold to prune cut subtrees early.
+  - **Enhanced Quiescence Search**: Includes queen/minor piece promotions and selective quiet checks (`gives_check`) within root plies (`ply <= 2`).
+  - **Logarithmic Late Move Reduction (LMR)**: Precomputed $64 \times 64$ logarithmic reduction table dynamically adjusted for cut-nodes and check evasions.
+  - **Syzygy Endgame Tablebases**: Direct Fathom probing engine integration supporting 3-4-5-6 piece Syzygy WDL tables and instant root move probing.
+  - Static Exchange Evaluation (SEE) pruning and move ordering
+  - Null Move Pruning with verification
   - Check extensions and threefold repetition detection
 
 ---
@@ -53,8 +59,13 @@ GiraffeGPU/
     ├── zobrist.h/.cpp      # 64-bit Zobrist hashing keys
     ├── see.h/.cpp          # Static Exchange Evaluation (SEE)
     ├── giraffe_features.h/.cpp # Exact 363-dim Giraffe feature extraction
-    ├── tt.h/.cpp           # Transposition Table implementation
-    ├── search.h/.cpp       # PVS Search, Iterative Deepening, Time Management
+    ├── tt.h/.cpp           # Transposition Table implementation (2-slot cluster with aging)
+    ├── syzygy_tb.h/.cpp    # Fathom Syzygy tablebase interface (WDL & root probing)
+    ├── syzygy/             # Fathom Syzygy endgame tablebase probing engine
+    │   ├── tbprobe.c/.h    # Syzygy WDL and DTZ probe routines
+    │   ├── tbcore.c/.h     # Core decompression and bit operations
+    │   └── tbconfig.h      # Syzygy probe configuration
+    ├── search.h/.cpp       # PVS Search, ProbCut, History gravity, Continuation History, LMR
     ├── uci.h/.cpp          # Universal Chess Interface handler & diagnostic CLI
     ├── main.cpp            # Engine entry point
     └── cuda/
@@ -165,8 +176,9 @@ Launch `./GiraffeGPU` (Linux) or `.\GiraffeGPU.exe` (Windows) directly:
 - `isready` - Confirms CUDA initialization on the selected GPU device.
 - `setoption name Device_GPU value <id>` - Selects GPU: `-1` (default) for **Both GPUs in parallel**, or `0` for GPU 0 only (RTX 3060), or `1` for GPU 1 only (RTX 5050).
 - `setoption name Threads value <num>` - Sets search worker threads (default `2` to saturate both GPUs concurrently).
-- `setoption name Hash value <MB>` - Sets transposition table size in MB (e.g., `256`).
+- `setoption name Hash value <MB>` - Sets transposition table size in MB (e.g., `256` or `1024`).
 - `setoption name BatchSize value <size>` - Sets maximum GPU evaluation batch size.
+- `setoption name SyzygyPath value <path>` - Path to Syzygy 3-4-5-6 piece tablebases (WDL and DTZ files, separated by semicolons or colons).
 - `setoption name Ponder value <true/false>` - Enables or disables pondering on opponent's time (default: `true`).
 - `setoption name WeightsFile value <path>` - Loads custom Giraffe network weights (e.g., `eval.net`).
 - `ucinewgame` - Resets transposition table and board state for a new game.

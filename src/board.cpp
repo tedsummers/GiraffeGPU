@@ -709,6 +709,46 @@ bool Board::is_repetition() const {
     return false;
 }
 
+bool Board::gives_check(Move m) const {
+    Color us = stm_;
+    Color them = ~us;
+    Square ksq = king_square(them);
+    if (ksq == SQ_NONE) return false;
+
+    Square from = m.from_sq();
+    Square to = m.to_sq();
+    Piece moving = square_piece_[from];
+    PieceType pt = piece_type(moving);
+
+    Bitboard occ = (occupied_bb() ^ square_bb(from)) | square_bb(to);
+
+    // Direct check from moving piece
+    Bitboard attacks = 0;
+    PieceType check_pt = m.is_promotion() ? m.promotion_type() : pt;
+    switch (check_pt) {
+        case KNIGHT: attacks = Bitboards::KNIGHT_ATTACKS[to]; break;
+        case BISHOP: attacks = Bitboards::bishop_attacks(to, occ); break;
+        case ROOK:   attacks = Bitboards::rook_attacks(to, occ); break;
+        case QUEEN:  attacks = Bitboards::queen_attacks(to, occ); break;
+        case PAWN:   attacks = Bitboards::PAWN_ATTACKS[us][to]; break;
+        default: break;
+    }
+    if (attacks & square_bb(ksq)) return true;
+
+    // Discovered check
+    Bitboard diag_slider = pieces_bb_[make_piece(us, BISHOP)] | pieces_bb_[make_piece(us, QUEEN)];
+    if ((diag_slider & ~square_bb(from)) && (Bitboards::bishop_attacks(ksq, occ) & diag_slider & ~square_bb(from))) {
+        return true;
+    }
+
+    Bitboard orth_slider = pieces_bb_[make_piece(us, ROOK)] | pieces_bb_[make_piece(us, QUEEN)];
+    if ((orth_slider & ~square_bb(from)) && (Bitboards::rook_attacks(ksq, occ) & orth_slider & ~square_bb(from))) {
+        return true;
+    }
+
+    return false;
+}
+
 void Board::print() const {
     std::cout << "\n +---+---+---+---+---+---+---+---+\n";
     for (int r = 7; r >= 0; --r) {
