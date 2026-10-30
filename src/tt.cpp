@@ -15,7 +15,7 @@ TranspositionTable::TranspositionTable()
 TranspositionTable::~TranspositionTable() = default;
 
 void TranspositionTable::resize(size_t mb) {
-    size_mb_ = std::max(size_t(1), std::min(mb, size_t(8192)));
+    size_mb_ = std::max(size_t(1), std::min(mb, size_t(16384)));
     size_t bytes = size_mb_ * 1024 * 1024;
     num_entries_ = bytes / sizeof(TTEntry);
     table_.assign(num_entries_, TTEntry{0, 0, 0, 0, TT_NONE, 0});
