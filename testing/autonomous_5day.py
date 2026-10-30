@@ -128,6 +128,7 @@ class AutonomousPipeline:
             sys.executable, os.path.join(TESTING_DIR, "match_sprt.py"),
             "--engine1", os.path.join(REPO_DIR, "GiraffeGPU"),
             "--engine2", baseline_engine,
+            "--engine1-options", f"WeightsFile={candidate_weights}",
             "--games", str(games),
             "--tc", "2+0.05",
             "--sprt"

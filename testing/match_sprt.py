@@ -113,7 +113,7 @@ def resolve_path(p):
     return os.path.abspath(p)
 
 def run_match(engine1_path, engine2_path, games=20, tc="10+0.1", book_path=None, concurrency=1,
-              elo0=0.0, elo1=10.0, sprt_mode=False):
+              elo0=0.0, elo1=10.0, sprt_mode=False, engine1_options=None, engine2_options=None):
 
     engine1_path = resolve_path(engine1_path)
     engine2_path = resolve_path(engine2_path)
@@ -142,15 +142,35 @@ def run_match(engine1_path, engine2_path, games=20, tc="10+0.1", book_path=None,
     e1_name = os.path.splitext(os.path.basename(engine1_path))[0]
     e2_name = os.path.splitext(os.path.basename(engine2_path))[0]
     if e1_name == e2_name:
-        e1_name += "_candidate"
-        e2_name += "_baseline"
+        if engine1_options and "PolicyNet=true" in engine1_options:
+            e1_name += "_PolicyOn"
+            e2_name += "_PolicyOff"
+        else:
+            e1_name += "_candidate"
+            e2_name += "_baseline"
 
     rounds_count = max(1, games // 2)
 
+    eng1_spec = [f"cmd={os.path.abspath(engine1_path)}", f"name={e1_name}"]
+    if engine1_options:
+        for opt in engine1_options.split(","):
+            opt = opt.strip()
+            if "=" in opt:
+                k, v = opt.split("=", 1)
+                eng1_spec.append(f"option.{k}={v}")
+
+    eng2_spec = [f"cmd={os.path.abspath(engine2_path)}", f"name={e2_name}"]
+    if engine2_options:
+        for opt in engine2_options.split(","):
+            opt = opt.strip()
+            if "=" in opt:
+                k, v = opt.split("=", 1)
+                eng2_spec.append(f"option.{k}={v}")
+
     cmd = [
         cutechess,
-        "-engine", f"cmd={os.path.abspath(engine1_path)}", f"name={e1_name}",
-        "-engine", f"cmd={os.path.abspath(engine2_path)}", f"name={e2_name}",
+        "-engine", *eng1_spec,
+        "-engine", *eng2_spec,
         "-each", "proto=uci", f"tc={tc}",
         "-games", "2",
         "-rounds", str(rounds_count),
@@ -238,7 +258,10 @@ def run_match(engine1_path, engine2_path, games=20, tc="10+0.1", book_path=None,
 def main():
     parser = argparse.ArgumentParser(description="GiraffeGPU Match & SPRT Testing Runner")
     parser.add_argument("--engine1", default="./GiraffeGPU", help="Path to engine 1 (candidate)")
-    parser.add_argument("--engine2", required=True, help="Path to engine 2 (baseline or opponent)")
+    parser.add_argument("--engine2", default=None, help="Path to engine 2 (baseline or opponent)")
+    parser.add_argument("--engine1-options", default=None, help="UCI options for engine 1 (e.g. PolicyNet=true)")
+    parser.add_argument("--engine2-options", default=None, help="UCI options for engine 2 (e.g. PolicyNet=false)")
+    parser.add_argument("--compare-policy", action="store_true", help="Direct A/B match comparing PolicyNet enabled vs disabled")
     parser.add_argument("--games", type=int, default=20, help="Number of games to play (default: 20)")
     parser.add_argument("--tc", default="5+0.1", help="Time control (default: 5+0.1)")
     parser.add_argument("--book", default="testing/books/openings.epd", help="Opening book (.epd or .pgn)")
@@ -249,18 +272,32 @@ def main():
 
     args = parser.parse_args()
 
+    if args.compare_policy:
+        engine2 = args.engine1
+        e1_opt = "PolicyNet=true" if not args.engine1_options else f"{args.engine1_options},PolicyNet=true"
+        e2_opt = "PolicyNet=false" if not args.engine2_options else f"{args.engine2_options},PolicyNet=false"
+    else:
+        if not args.engine2:
+            print("Error: --engine2 <path> is required unless --compare-policy is specified.")
+            sys.exit(1)
+        engine2 = args.engine2
+        e1_opt = args.engine1_options
+        e2_opt = args.engine2_options
+
     book = args.book if os.path.exists(args.book) else None
 
     run_match(
         engine1_path=args.engine1,
-        engine2_path=args.engine2,
+        engine2_path=engine2,
         games=args.games,
         tc=args.tc,
         book_path=book,
         concurrency=args.concurrency,
         elo0=args.elo0,
         elo1=args.elo1,
-        sprt_mode=args.sprt
+        sprt_mode=args.sprt,
+        engine1_options=e1_opt,
+        engine2_options=e2_opt
     )
 
 if __name__ == "__main__":

@@ -56,6 +56,7 @@ Examples:
 
     parser.add_argument("--match", action="store_true", help="Run head-to-head match against engine2")
     parser.add_argument("--sprt", action="store_true", help="Run SPRT test against engine2")
+    parser.add_argument("--compare-policy", action="store_true", help="Run A/B match comparing PolicyNet enabled vs disabled")
     parser.add_argument("--engine2", default=None, help="Opponent / baseline engine binary")
     parser.add_argument("--games", type=int, default=20, help="Number of games to play (default: 20)")
     parser.add_argument("--tc", default="5+0.1", help="Time control for match (default: 5+0.1)")
@@ -63,13 +64,26 @@ Examples:
     parser.add_argument("--elo1", type=float, default=10.0, help="SPRT H1 Elo bound")
 
     parser.add_argument("--selfplay", action="store_true", help="Run self-play data generation")
+    parser.add_argument("--train", action="store_true", help="Train dual-head neural network weights on selfplay data")
+    parser.add_argument("--epochs", type=int, default=3, help="Training epochs (default: 3)")
     parser.add_argument("--spsa", action="store_true", help="Run SPSA search parameter tuning")
     parser.add_argument("--iters", type=int, default=10, help="Iterations for SPSA tuning")
 
     args = parser.parse_args()
 
     # Determine action
-    if args.match or args.sprt:
+    if args.compare_policy:
+        sub_args = [
+            "--engine1", args.engine,
+            "--compare-policy",
+            "--games", str(args.games),
+            "--tc", args.tc
+        ]
+        if args.sprt:
+            sub_args.extend(["--sprt", "--elo0", str(args.elo0), "--elo1", str(args.elo1)])
+        sys.exit(run_cmd("match_sprt.py", sub_args))
+
+    elif args.match or args.sprt:
         if not args.engine2:
             print("Error: --engine2 <path> is required for --match and --sprt.")
             sys.exit(1)
@@ -82,6 +96,12 @@ Examples:
         if args.sprt:
             sub_args.extend(["--sprt", "--elo0", str(args.elo0), "--elo1", str(args.elo1)])
         sys.exit(run_cmd("match_sprt.py", sub_args))
+
+    elif args.train:
+        sub_args = [
+            "--epochs", str(args.epochs)
+        ]
+        sys.exit(run_cmd("train_weights.py", sub_args))
 
     elif args.selfplay:
         sub_args = [
