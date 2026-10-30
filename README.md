@@ -15,7 +15,11 @@
 
 ## Highlights
 
-- **Native NVIDIA CUDA Acceleration**: Executes the neural network forward pass directly on NVIDIA GPUs using optimized CUDA kernels (`forward_l1_kernel`, `forward_l2_kernel`, `forward_l3_kernel`).
+- **Native NVIDIA CUDA Acceleration**: Executes the neural network forward pass directly on NVIDIA GPUs using optimized CUDA kernels (`forward_l1_kernel`, `forward_l2_kernel`, `forward_l3_kernel`, `forward_policy_kernel`).
+- **Dual-Head Neural Architecture (Value + Policy)**:
+  - **Shared Trunk**: 363-dimensional input $\to$ 512 hidden ($L_1$, ReLU) $\to$ 64 signature ($L_2$, ReLU).
+  - **Value Head**: $64 \to 1$ scalar evaluation in centipawns ($\tanh$ activation).
+  - **Policy Head**: $64 \to 4096$ candidate move logits (`POLICY_DIM = 4096`, $(from \ll 6) \mid to$ square transitions) computed in parallel with host-side numerically stable Softmax over legal moves.
 - **Faithful Giraffe Feature Representation**: Computes the complete **363-dimensional** Giraffe feature vector:
   - **Global features (19)**: Material counts (WQ, WR, WB, WN, WP, BQ, BR, BB, BN, BP), side to move, king coordinates, and short/long castling rights.
   - **Pawn features (80)**: 16 pawn slots (8 White, 8 Black) assigned to nearest files, tracking presence, $(x, y)$ coordinates, and White/Black control values.
@@ -29,6 +33,8 @@
 - **Universal Chess Interface (UCI) Protocol**: Compatible with all standard chess GUIs (CuteChess, Arena, Scid vs PC, Nibbler, etc.).
 - **Engine Search Features**:
   - Negamax with Principal Variation Search (PVS)
+  - **Policy-Guided Move Ordering**: Combines TT moves, MVV-LVA captures, SEE, Killer moves, Countermove heuristic, Continuation history, and policy head logits (`score += static_cast<int>(logit * 5000.0f)`).
+  - **Policy-Guided LMR**: Reduces LMR depth discount for high-confidence policy moves (`logit > 1.2`), focusing tree search on natural master moves while pruning low-confidence candidate moves (`logit < -1.5`) earlier.
   - Iterative Deepening with dynamic widening Aspiration Windows (fail-low / fail-high widening)
   - **2-Slot Clustered Transposition Table**: Depth-preferred slot with aging demotion and Always-replace/Age-preferred slot, with 32-bit key verification and 16-byte cache alignment.
   - **History Gravity**: Dynamic positive bonus and negative malus decay formula (`score += bonus - (score * |bonus|)/16384`) capped at $\pm 16384$.
@@ -152,6 +158,10 @@ g++ -O3 -std=c++17 -Isrc -pthread src/*.cpp -o GiraffeGPU.exe
 
 # Run benchmark across standard test positions (depth 5):
 ./GiraffeGPU bench 5
+
+# Evaluate position through Dual-Head Policy Network (top moves, probabilities, and logits):
+./GiraffeGPU policy
+./GiraffeGPU policy "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2"
 ```
 
 #### Windows:
@@ -161,6 +171,9 @@ g++ -O3 -std=c++17 -Isrc -pthread src/*.cpp -o GiraffeGPU.exe
 
 # Run benchmark across standard test positions:
 .\GiraffeGPU.exe bench 5
+
+# Inspect Policy Network candidate move distribution:
+.\GiraffeGPU.exe policy
 ```
 
 ---
@@ -178,9 +191,10 @@ Launch `./GiraffeGPU` (Linux) or `.\GiraffeGPU.exe` (Windows) directly:
 - `setoption name Threads value <num>` - Sets search worker threads (default `2` to saturate both GPUs concurrently).
 - `setoption name Hash value <MB>` - Sets transposition table size in MB (e.g., `256` or `1024`).
 - `setoption name BatchSize value <size>` - Sets maximum GPU evaluation batch size.
+- `setoption name PolicyNet value <true/false>` - Enables or disables Dual-Head Policy Network move ordering and LMR guidance (default: `true`).
 - `setoption name SyzygyPath value <path>` - Path to Syzygy 3-4-5-6 piece tablebases (WDL and DTZ files, separated by semicolons or colons).
 - `setoption name Ponder value <true/false>` - Enables or disables pondering on opponent's time (default: `true`).
-- `setoption name WeightsFile value <path>` - Loads custom Giraffe network weights (e.g., `eval.net`).
+- `setoption name WeightsFile value <path>` - Loads custom Giraffe network weights (supports both `GIRAFDUAL` and legacy `GIRAFGPU` formats).
 - `ucinewgame` - Resets transposition table and board state for a new game.
 - `position startpos [moves e2e4 ...]` - Sets up the board position.
 - `position fen <fen> [moves ...]` - Sets up position from FEN.
@@ -188,7 +202,8 @@ Launch `./GiraffeGPU` (Linux) or `.\GiraffeGPU.exe` (Windows) directly:
 - `go ponder [wtime <ms> btime <ms> ...]` - Starts pondering on opponent's clock.
 - `ponderhit` - Signals that opponent played the predicted ponder move; seamlessly transitions to normal search.
 - `stop` - Stops search and returns best move immediately.
-- `eval` - Evaluates current position on the GPU and prints centipawns.
+- `eval` - Evaluates current position on the GPU; reports centipawns and top policy moves with win percentages.
+- `policy [fen]` - Displays ranked legal move probability distribution and raw logits from the policy head.
 - `perft <depth>` - Performs move generation test.
 - `d` - Prints formatted ASCII board representation.
 - `quit` - Exits the engine cleanly.
@@ -224,8 +239,15 @@ python3 testing/run_tests.py --match --engine ./GiraffeGPU --engine2 /path/to/op
 
 # Run SPRT test (stops early as soon as Elo gain/regression is statistically proven at 95% confidence):
 python3 testing/run_tests.py --sprt --engine ./GiraffeGPU_candidate --engine2 ./GiraffeGPU_base --elo0 0.0 --elo1 10.0
+
+# Run direct A/B match isolating the Dual-Head Policy Network (PolicyNet On vs Off):
+python3 testing/run_tests.py --compare-policy --games 20 --tc 5+0.1
+
+# SPRT statistical validation for the Policy Network:
+python3 testing/run_tests.py --compare-policy --sprt --elo0 0.0 --elo1 15.0 --games 100 --tc 3+0.05
 ```
 - Real-time scoreboard with **Elo difference**, **95% confidence error margins ($\pm$)**, **Likelihood of Superiority (LOS %)**, and **Log-Likelihood Ratio (LLR)**.
+- Supports custom UCI engine parameters via `--engine1-options` and `--engine2-options` (e.g. `PolicyNet=true`, `WeightsFile=candidate.net`).
 - Saves full game transcripts to `testing/results/match_<timestamp>.pgn`.
 
 ### 3. Self-Play & Reinforcement Learning Data Generator
@@ -237,16 +259,29 @@ python3 testing/run_tests.py --selfplay --games 50 --movetime 100
 # or quick run:
 make test-selfplay
 ```
-- Saves position FENs, move evaluations, depths, and game outcomes directly to `testing/results/selfplay_dataset.jsonl`.
+- Saves position FENs, candidate moves, evaluations, search depths, and game outcomes directly to `testing/results/selfplay_dataset.jsonl`.
 
-### 4. SPSA Automated Search Parameter Tuner
+### 4. Dual-Head Neural Weight Trainer (`train_weights.py`)
+Trains and fine-tunes both the Value Head (position evaluation) and the Policy Head (move selection logits) on cumulative self-play datasets:
+
+```bash
+# Fine-tune dual-head network weights on self-play data:
+python3 testing/run_tests.py --train --epochs 5
+
+# Or invoke the trainer directly with custom weight paths:
+python3 testing/train_weights.py --data testing/results/selfplay_dataset.jsonl --in-weights eval.net --out-weights testing/results/candidate.net --epochs 5
+```
+- **Dual Loss Optimization**: Minimizes mean-squared error for the scalar value head while optimizing cross-entropy loss over legal moves for the policy head.
+- **Binary Format Support**: Serializes networks in high-efficiency `GIRAFDUAL` format with complete backward compatibility for legacy `GIRAFGPU` files.
+
+### 5. SPSA Automated Search Parameter Tuner
 Uses Simultaneous Perturbation Stochastic Approximation to optimize search and pruning parameters (null move reduction, LMR thresholds, aspiration window margins, SEE margins):
 
 ```bash
 python3 testing/run_tests.py --spsa --iters 20 --tc 3+0.05
 ```
 
-### 5. 5-Day Autonomous Self-Improvement System (`autonomous_5day.py`)
+### 6. 5-Day Autonomous Self-Improvement System (`autonomous_5day.py`)
 
 GiraffeGPU includes a fully automated, 120-hour (5-day) self-improvement daemon that runs 24/7 across both NVIDIA GPUs (RTX 3060 and RTX 5050), progressively training network weights and optimizing search heuristics without requiring human intervention.
 
