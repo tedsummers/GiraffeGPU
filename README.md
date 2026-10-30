@@ -395,3 +395,9 @@ cutechess-cli \
 1. Matthew Lai, *"Giraffe: Using Deep Reinforcement Learning to Play Chess"*, MSc Thesis, Imperial College London, 2015. [arXiv:1509.01549](http://arxiv.org/abs/1509.01549)
 2. Chessprogramming Wiki: [Giraffe](https://chessprogramming.org/Giraffe)
 3. Giraffe GitHub Repository: [ianfab/Giraffe](https://github.com/ianfab/Giraffe)
+
+---
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
