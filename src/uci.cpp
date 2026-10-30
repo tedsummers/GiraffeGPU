@@ -6,6 +6,9 @@
 #include <sstream>
 #include <vector>
 #include <chrono>
+#include <iomanip>
+#include <algorithm>
+#include <tuple>
 
 UCI::UCI() = default;
 
@@ -28,6 +31,7 @@ void UCI::handle_uci() {
     std::cout << "option name Device_GPU type spin default -1 min -1 max 7" << std::endl;
     std::cout << "option name BatchSize type spin default 512 min 1 max 4096" << std::endl;
     std::cout << "option name Ponder type check default true" << std::endl;
+    std::cout << "option name PolicyNet type check default true" << std::endl;
     std::cout << "option name SyzygyPath type string default <empty>" << std::endl;
     std::cout << "option name WeightsFile type string default eval.net" << std::endl;
     std::cout << "uciok" << std::endl;
@@ -82,6 +86,10 @@ void UCI::handle_setoption(const std::string& line) {
         bool enable = (val_str == "true" || val_str == "1");
         g_search.set_ponder_enabled(enable);
         std::cout << "info string Ponder set to " << (enable ? "true" : "false") << std::endl;
+    } else if (opt_name == "PolicyNet") {
+        bool enable = (val_str == "true" || val_str == "1");
+        g_search.set_policy_net_enabled(enable);
+        std::cout << "info string PolicyNet set to " << (enable ? "true" : "false") << std::endl;
     } else if (opt_name == "SyzygyPath") {
         g_search.set_syzygy_path(val_str);
         std::cout << "info string SyzygyPath set to " << val_str << " (TB_LARGEST=" << Syzygy::max_pieces() << ")" << std::endl;
@@ -218,9 +226,100 @@ void UCI::handle_eval() {
     if (!Neural::g_neural_gpu.is_initialized()) {
         Neural::g_neural_gpu.init(Neural::ALL_GPUS, 512);
     }
-    Value val = Neural::g_neural_gpu.evaluate(board_);
+    std::vector<float> policy(Neural::POLICY_DIM);
+    Value val = Neural::g_neural_gpu.evaluate_dual(board_, policy.data());
     std::cout << "Giraffe GPU Evaluation: " << val << " cp (side to move perspective)" << std::endl;
     std::cout << "Side to move: " << (board_.side_to_move() == WHITE ? "White" : "Black") << std::endl;
+
+    std::vector<Move> legal;
+    board_.generate_legal_moves(legal);
+    if (!legal.empty()) {
+        std::vector<float> probs;
+        Neural::g_neural_gpu.get_move_probabilities(board_, legal, probs);
+        std::vector<std::pair<float, Move>> sorted_moves;
+        for (size_t i = 0; i < legal.size(); ++i) {
+            sorted_moves.emplace_back(probs[i], legal[i]);
+        }
+        std::sort(sorted_moves.begin(), sorted_moves.end(), [](const auto& a, const auto& b) {
+            return a.first > b.first;
+        });
+        std::cout << "Top Policy Moves:" << std::endl;
+        for (size_t i = 0; i < std::min<size_t>(3, sorted_moves.size()); ++i) {
+            int pol_idx = (static_cast<int>(sorted_moves[i].second.from_sq()) << 6) | static_cast<int>(sorted_moves[i].second.to_sq());
+            std::cout << "  " << (i + 1) << ". " << sorted_moves[i].second.to_uci()
+                      << "  " << std::fixed << std::setprecision(2) << (sorted_moves[i].first * 100.0f)
+                      << "% (logit: " << std::showpos << policy[pol_idx] << std::noshowpos << ")" << std::endl;
+        }
+    }
+}
+
+void UCI::handle_policy(const std::string& line) {
+    if (!Neural::g_neural_gpu.is_initialized()) {
+        Neural::g_neural_gpu.init(Neural::ALL_GPUS, 512);
+    }
+
+    Board b = board_;
+    if (!line.empty()) {
+        std::istringstream iss(line);
+        std::string cmd;
+        iss >> cmd; // "policy"
+        std::string fen;
+        std::string word;
+        while (iss >> word) {
+            if (!fen.empty()) fen += " ";
+            fen += word;
+        }
+        if (!fen.empty()) {
+            b.set_fen(fen);
+        }
+    }
+
+    std::vector<Move> legal;
+    b.generate_legal_moves(legal);
+    if (legal.empty()) {
+        std::cout << "No legal moves in position." << std::endl;
+        return;
+    }
+
+    std::vector<float> policy(Neural::POLICY_DIM);
+    Value val = Neural::g_neural_gpu.evaluate_dual(b, policy.data());
+    std::vector<float> probs;
+    Neural::g_neural_gpu.get_move_probabilities(b, legal, probs);
+
+    std::vector<std::tuple<float, float, Move>> sorted_moves;
+    for (size_t i = 0; i < legal.size(); ++i) {
+        int pol_idx = (static_cast<int>(legal[i].from_sq()) << 6) | static_cast<int>(legal[i].to_sq());
+        sorted_moves.emplace_back(probs[i], policy[pol_idx], legal[i]);
+    }
+    std::sort(sorted_moves.begin(), sorted_moves.end(), [](const auto& x, const auto& y) {
+        return std::get<0>(x) > std::get<0>(y);
+    });
+
+    std::cout << "Giraffe Dual-Head Policy Network Evaluation:" << std::endl;
+    std::cout << "Position FEN: " << b.to_fen() << std::endl;
+    std::cout << "Value Head:   " << val << " cp (" << (b.side_to_move() == WHITE ? "White" : "Black") << " to move)" << std::endl;
+    std::cout << "Policy Head Move Distribution (Top " << std::min<size_t>(10, sorted_moves.size()) << " of " << legal.size() << " legal moves):" << std::endl;
+    std::cout << " Rank  Move    Probability    Logit" << std::endl;
+    std::cout << " -----------------------------------" << std::endl;
+
+    for (size_t i = 0; i < std::min<size_t>(10, sorted_moves.size()); ++i) {
+        float p = std::get<0>(sorted_moves[i]);
+        float logit = std::get<1>(sorted_moves[i]);
+        Move m = std::get<2>(sorted_moves[i]);
+        std::cout << "  " << std::setw(2) << (i + 1) << ".  "
+                  << std::setw(6) << std::left << m.to_uci() << std::right
+                  << std::setw(8) << std::fixed << std::setprecision(2) << (p * 100.0f) << "%"
+                  << "     " << std::showpos << std::fixed << std::setprecision(3) << logit << std::noshowpos
+                  << std::endl;
+    }
+}
+
+void UCI::handle_policy_cmd(const std::string& fen) {
+    if (!Neural::g_neural_gpu.is_initialized()) {
+        Neural::g_neural_gpu.init(Neural::ALL_GPUS, 512);
+    }
+    board_.set_fen(fen);
+    handle_policy("");
 }
 
 void UCI::handle_gpu_info() {
@@ -307,6 +406,8 @@ void UCI::loop() {
             board_.print();
         } else if (cmd == "eval") {
             handle_eval();
+        } else if (cmd == "policy") {
+            handle_policy(line);
         } else if (cmd == "gpu_info") {
             handle_gpu_info();
         } else if (cmd == "perft") {

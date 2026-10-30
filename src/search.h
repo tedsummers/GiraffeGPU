@@ -91,6 +91,9 @@ public:
         Syzygy::init(path);
     }
 
+    void set_policy_net_enabled(bool enabled) { policy_net_enabled_ = enabled; }
+    bool is_policy_net_enabled() const { return policy_net_enabled_; }
+
 private:
     void search_root(Board& board);
     void worker_search(Board board, int worker_id, int max_depth);
@@ -98,7 +101,7 @@ private:
     Value pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha, Value beta, bool cut_node);
     Value qsearch(Board& board, SearchWorker& w, int ply, Value alpha, Value beta);
 
-    void order_moves(const Board& board, const SearchWorker& w, std::vector<Move>& moves, Move tt_move, int ply);
+    void order_moves(const Board& board, const SearchWorker& w, std::vector<Move>& moves, Move tt_move, int ply, const float* policy = nullptr);
     void update_quiet_history(SearchWorker& w, const Board& board, Move best_quiet, const std::vector<Move>& quiet_moves, int depth, int ply);
 
     bool check_time();
@@ -109,6 +112,7 @@ private:
     std::atomic<uint64_t> nodes_;
 
     bool ponder_enabled_;
+    bool policy_net_enabled_;
     int num_threads_;
     SearchLimits limits_;
     std::chrono::steady_clock::time_point start_time_;

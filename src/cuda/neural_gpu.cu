@@ -95,6 +95,30 @@ __global__ void forward_l3_kernel(
     }
 }
 
+__global__ void forward_policy_kernel(
+    const float* __restrict__ d_h2,
+    const float* __restrict__ d_w_pol,
+    const float* __restrict__ d_b_pol,
+    float* __restrict__ d_policy,
+    int batch_size)
+{
+    int pol_idx = blockIdx.x * blockDim.x + threadIdx.x; // 0 .. 4095
+    int batch_idx = blockIdx.y;
+
+    if (pol_idx < POLICY_DIM && batch_idx < batch_size) {
+        const float* h2 = d_h2 + batch_idx * L2_DIM;
+        const float* w = d_w_pol + pol_idx * L2_DIM;
+
+        float sum = d_b_pol[pol_idx];
+        #pragma unroll 4
+        for (int i = 0; i < L2_DIM; ++i) {
+            sum += h2[i] * w[i];
+        }
+
+        d_policy[batch_idx * POLICY_DIM + pol_idx] = sum;
+    }
+}
+
 // DeviceContext Implementation
 
 DeviceContext::DeviceContext()
@@ -103,16 +127,20 @@ DeviceContext::DeviceContext()
     , initialized(false)
     , h_input_batch(nullptr)
     , h_output_batch(nullptr)
+    , h_policy_batch(nullptr)
     , d_w1(nullptr)
     , d_b1(nullptr)
     , d_w2(nullptr)
     , d_b2(nullptr)
     , d_w3(nullptr)
     , d_b3(nullptr)
+    , d_w_pol(nullptr)
+    , d_b_pol(nullptr)
     , d_input_batch(nullptr)
     , d_hidden1_batch(nullptr)
     , d_hidden2_batch(nullptr)
     , d_output_batch(nullptr)
+    , d_policy_batch(nullptr)
     , cuda_stream(nullptr)
 {}
 
@@ -123,7 +151,8 @@ DeviceContext::~DeviceContext() {
 bool DeviceContext::init(int dev_id, int batch_size,
                          const std::vector<float>& w1, const std::vector<float>& b1,
                          const std::vector<float>& w2, const std::vector<float>& b2,
-                         const std::vector<float>& w3, const std::vector<float>& b3)
+                         const std::vector<float>& w3, const std::vector<float>& b3,
+                         const std::vector<float>& w_pol, const std::vector<float>& b_pol)
 {
     device_id = dev_id;
     max_batch_size = batch_size;
@@ -141,6 +170,7 @@ bool DeviceContext::init(int dev_id, int batch_size,
     // Host pinned memory
     cudaMallocHost(&h_input_batch, max_batch_size * IN_DIM * sizeof(float));
     cudaMallocHost(&h_output_batch, max_batch_size * OUT_DIM * sizeof(float));
+    cudaMallocHost(&h_policy_batch, max_batch_size * POLICY_DIM * sizeof(float));
 
     // Device weights
     cudaMalloc(&d_w1, IN_DIM * L1_DIM * sizeof(float));
@@ -149,14 +179,17 @@ bool DeviceContext::init(int dev_id, int batch_size,
     cudaMalloc(&d_b2, L2_DIM * sizeof(float));
     cudaMalloc(&d_w3, L2_DIM * OUT_DIM * sizeof(float));
     cudaMalloc(&d_b3, OUT_DIM * sizeof(float));
+    cudaMalloc(&d_w_pol, POLICY_DIM * L2_DIM * sizeof(float));
+    cudaMalloc(&d_b_pol, POLICY_DIM * sizeof(float));
 
     // Device batch buffers
     cudaMalloc(&d_input_batch, max_batch_size * IN_DIM * sizeof(float));
     cudaMalloc(&d_hidden1_batch, max_batch_size * L1_DIM * sizeof(float));
     cudaMalloc(&d_hidden2_batch, max_batch_size * L2_DIM * sizeof(float));
     cudaMalloc(&d_output_batch, max_batch_size * OUT_DIM * sizeof(float));
+    cudaMalloc(&d_policy_batch, max_batch_size * POLICY_DIM * sizeof(float));
 
-    copy_weights(w1, b1, w2, b2, w3, b3);
+    copy_weights(w1, b1, w2, b2, w3, b3, w_pol, b_pol);
 
     initialized = true;
     return true;
@@ -164,7 +197,8 @@ bool DeviceContext::init(int dev_id, int batch_size,
 
 void DeviceContext::copy_weights(const std::vector<float>& w1, const std::vector<float>& b1,
                                  const std::vector<float>& w2, const std::vector<float>& b2,
-                                 const std::vector<float>& w3, const std::vector<float>& b3)
+                                 const std::vector<float>& w3, const std::vector<float>& b3,
+                                 const std::vector<float>& w_pol, const std::vector<float>& b_pol)
 {
     cudaSetDevice(device_id);
     cudaMemcpy(d_w1, w1.data(), IN_DIM * L1_DIM * sizeof(float), cudaMemcpyHostToDevice);
@@ -173,6 +207,8 @@ void DeviceContext::copy_weights(const std::vector<float>& w1, const std::vector
     cudaMemcpy(d_b2, b2.data(), L2_DIM * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_w3, w3.data(), L2_DIM * OUT_DIM * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_b3, b3.data(), OUT_DIM * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_w_pol, w_pol.data(), POLICY_DIM * L2_DIM * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_b_pol, b_pol.data(), POLICY_DIM * sizeof(float), cudaMemcpyHostToDevice);
 }
 
 void DeviceContext::shutdown() {
@@ -187,6 +223,7 @@ void DeviceContext::shutdown() {
 
     if (h_input_batch) { cudaFreeHost(h_input_batch); h_input_batch = nullptr; }
     if (h_output_batch) { cudaFreeHost(h_output_batch); h_output_batch = nullptr; }
+    if (h_policy_batch) { cudaFreeHost(h_policy_batch); h_policy_batch = nullptr; }
 
     if (d_w1) { cudaFree(d_w1); d_w1 = nullptr; }
     if (d_b1) { cudaFree(d_b1); d_b1 = nullptr; }
@@ -194,11 +231,14 @@ void DeviceContext::shutdown() {
     if (d_b2) { cudaFree(d_b2); d_b2 = nullptr; }
     if (d_w3) { cudaFree(d_w3); d_w3 = nullptr; }
     if (d_b3) { cudaFree(d_b3); d_b3 = nullptr; }
+    if (d_w_pol) { cudaFree(d_w_pol); d_w_pol = nullptr; }
+    if (d_b_pol) { cudaFree(d_b_pol); d_b_pol = nullptr; }
 
     if (d_input_batch) { cudaFree(d_input_batch); d_input_batch = nullptr; }
     if (d_hidden1_batch) { cudaFree(d_hidden1_batch); d_hidden1_batch = nullptr; }
     if (d_hidden2_batch) { cudaFree(d_hidden2_batch); d_hidden2_batch = nullptr; }
     if (d_output_batch) { cudaFree(d_output_batch); d_output_batch = nullptr; }
+    if (d_policy_batch) { cudaFree(d_policy_batch); d_policy_batch = nullptr; }
 
     initialized = false;
 }
@@ -219,6 +259,39 @@ Value DeviceContext::evaluate_single(const Board& board) {
 
     cudaMemcpyAsync(h_output_batch, d_output_batch, OUT_DIM * sizeof(float), cudaMemcpyDeviceToHost, stream);
     cudaStreamSynchronize(stream);
+
+    float raw_score = h_output_batch[0];
+    float cp = raw_score * 1000.0f;
+    Value val = static_cast<Value>(std::round(cp));
+    return (board.side_to_move() == WHITE) ? val : -val;
+}
+
+Value DeviceContext::evaluate_dual(const Board& board, float* out_policy_4096) {
+    std::lock_guard<std::mutex> lock(mtx);
+    cudaSetDevice(device_id);
+
+    Giraffe::extract_features(board, h_input_batch);
+
+    cudaStream_t stream = static_cast<cudaStream_t>(cuda_stream);
+    cudaMemcpyAsync(d_input_batch, h_input_batch, IN_DIM * sizeof(float), cudaMemcpyHostToDevice, stream);
+
+    dim3 grid_l1((L1_DIM + 63) / 64, 1);
+    forward_l1_kernel<<<grid_l1, 64, 0, stream>>>(d_input_batch, d_w1, d_b1, d_hidden1_batch, 1);
+    forward_l2_kernel<<<1, 64, 0, stream>>>(d_hidden1_batch, d_w2, d_b2, d_hidden2_batch, 1);
+    forward_l3_kernel<<<1, 64, 0, stream>>>(d_hidden2_batch, d_w3, d_b3, d_output_batch, 1);
+
+    dim3 grid_pol(POLICY_DIM / 64, 1);
+    forward_policy_kernel<<<grid_pol, 64, 0, stream>>>(d_hidden2_batch, d_w_pol, d_b_pol, d_policy_batch, 1);
+
+    cudaMemcpyAsync(h_output_batch, d_output_batch, OUT_DIM * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    if (out_policy_4096) {
+        cudaMemcpyAsync(h_policy_batch, d_policy_batch, POLICY_DIM * sizeof(float), cudaMemcpyDeviceToHost, stream);
+    }
+    cudaStreamSynchronize(stream);
+
+    if (out_policy_4096) {
+        std::memcpy(out_policy_4096, h_policy_batch, POLICY_DIM * sizeof(float));
+    }
 
     float raw_score = h_output_batch[0];
     float cp = raw_score * 1000.0f;
@@ -272,6 +345,8 @@ NeuralGPU::NeuralGPU()
     h_b2_.resize(L2_DIM, 0.0f);
     h_w3_.resize(L2_DIM * OUT_DIM, 0.0f);
     h_b3_.resize(OUT_DIM, 0.0f);
+    h_w_pol_.resize(POLICY_DIM * L2_DIM, 0.0f);
+    h_b_pol_.resize(POLICY_DIM, 0.0f);
 }
 
 NeuralGPU::~NeuralGPU() {
@@ -332,7 +407,7 @@ bool NeuralGPU::init(int device_id, int max_batch_size) {
 
     for (int dev : target_devices) {
         auto ctx = std::make_unique<DeviceContext>();
-        if (ctx->init(dev, max_batch_size_, h_w1_, h_b1_, h_w2_, h_b2_, h_w3_, h_b3_)) {
+        if (ctx->init(dev, max_batch_size_, h_w1_, h_b1_, h_w2_, h_b2_, h_w3_, h_b3_, h_w_pol_, h_b_pol_)) {
             contexts_.push_back(std::move(ctx));
         }
     }
@@ -386,6 +461,8 @@ void NeuralGPU::init_default_weights() {
     std::fill(h_b2_.begin(), h_b2_.end(), 0.0f);
     std::fill(h_w3_.begin(), h_w3_.end(), 0.0f);
     std::fill(h_b3_.begin(), h_b3_.end(), 0.0f);
+    std::fill(h_w_pol_.begin(), h_w_pol_.end(), 0.0f);
+    std::fill(h_b_pol_.begin(), h_b_pol_.end(), 0.0f);
 
     // Neuron 0: White Material accumulator
     // Neuron 1: Black Material accumulator
@@ -438,12 +515,55 @@ void NeuralGPU::init_default_weights() {
     h_w2_[1 * L1_DIM + 3] =  1.0f;
     h_w2_[1 * L1_DIM + 4] = -1.0f;
 
-    // Layer 3: Output layer
+    // Layer 3: Output layer (Value Head)
     h_w3_[0] =  0.10f;
     h_w3_[1] = -0.10f;
 
+    // Policy Head Priors:
+    // Natural central destination squares bonus
+    for (int from = 0; from < 64; ++from) {
+        for (int to : central_squares) {
+            h_b_pol_[(from << 6) | to] += 0.40f;
+        }
+    }
+
+    auto set_prior = [&](int from, int to, float val) {
+        h_b_pol_[(from << 6) | to] += val;
+    };
+
+    // White canonical opening moves
+    set_prior(12, 28, 2.5f); // e2e4
+    set_prior(11, 27, 2.5f); // d2d4
+    set_prior(6,  21, 2.0f); // g1f3
+    set_prior(1,  18, 1.8f); // b1c3
+    set_prior(10, 26, 1.8f); // c2c4
+    set_prior(4,  6,  2.0f); // e1g1 (O-O)
+    set_prior(4,  2,  1.5f); // e1c1 (O-O-O)
+
+    // Black canonical opening moves
+    set_prior(52, 36, 2.5f); // e7e5
+    set_prior(51, 35, 2.5f); // d7d5
+    set_prior(62, 45, 2.0f); // g8f6
+    set_prior(57, 42, 1.8f); // b8c6
+    set_prior(50, 34, 1.8f); // c7c5
+    set_prior(60, 62, 2.0f); // e8g8 (O-O)
+    set_prior(60, 58, 1.5f); // e8c8 (O-O-O)
+
+    // Connect shared L2 neurons to forward move vectors:
+    for (int from = 0; from < 64; ++from) {
+        for (int to = 0; to < 64; ++to) {
+            int idx = (from << 6) | to;
+            int delta_rank = (to / 8) - (from / 8);
+            if (delta_rank > 0) {
+                h_w_pol_[idx * L2_DIM + 0] = 0.04f * delta_rank;
+            } else if (delta_rank < 0) {
+                h_w_pol_[idx * L2_DIM + 1] = -0.04f * delta_rank;
+            }
+        }
+    }
+
     for (auto& ctx : contexts_) {
-        ctx->copy_weights(h_w1_, h_b1_, h_w2_, h_b2_, h_w3_, h_b3_);
+        ctx->copy_weights(h_w1_, h_b1_, h_w2_, h_b2_, h_w3_, h_b3_, h_w_pol_, h_b_pol_);
     }
 }
 
@@ -456,7 +576,16 @@ bool NeuralGPU::load_weights(const std::string& path) {
 
     char magic[8];
     is.read(magic, 8);
-    if (std::strncmp(magic, "GIRAFGPU", 8) == 0) {
+    if (std::strncmp(magic, "GIRAFDUAL", 8) == 0) {
+        is.read(reinterpret_cast<char*>(h_w1_.data()), h_w1_.size() * sizeof(float));
+        is.read(reinterpret_cast<char*>(h_b1_.data()), h_b1_.size() * sizeof(float));
+        is.read(reinterpret_cast<char*>(h_w2_.data()), h_w2_.size() * sizeof(float));
+        is.read(reinterpret_cast<char*>(h_b2_.data()), h_b2_.size() * sizeof(float));
+        is.read(reinterpret_cast<char*>(h_w3_.data()), h_w3_.size() * sizeof(float));
+        is.read(reinterpret_cast<char*>(h_b3_.data()), h_b3_.size() * sizeof(float));
+        is.read(reinterpret_cast<char*>(h_w_pol_.data()), h_w_pol_.size() * sizeof(float));
+        is.read(reinterpret_cast<char*>(h_b_pol_.data()), h_b_pol_.size() * sizeof(float));
+    } else if (std::strncmp(magic, "GIRAFGPU", 8) == 0) {
         is.read(reinterpret_cast<char*>(h_w1_.data()), h_w1_.size() * sizeof(float));
         is.read(reinterpret_cast<char*>(h_b1_.data()), h_b1_.size() * sizeof(float));
         is.read(reinterpret_cast<char*>(h_w2_.data()), h_w2_.size() * sizeof(float));
@@ -494,7 +623,7 @@ bool NeuralGPU::load_weights(const std::string& path) {
     }
 
     for (auto& ctx : contexts_) {
-        ctx->copy_weights(h_w1_, h_b1_, h_w2_, h_b2_, h_w3_, h_b3_);
+        ctx->copy_weights(h_w1_, h_b1_, h_w2_, h_b2_, h_w3_, h_b3_, h_w_pol_, h_b_pol_);
     }
     return true;
 }
@@ -502,13 +631,15 @@ bool NeuralGPU::load_weights(const std::string& path) {
 bool NeuralGPU::save_weights(const std::string& path) {
     std::ofstream os(path, std::ios::binary);
     if (!os) return false;
-    os.write("GIRAFGPU", 8);
+    os.write("GIRAFDUAL", 8);
     os.write(reinterpret_cast<const char*>(h_w1_.data()), h_w1_.size() * sizeof(float));
     os.write(reinterpret_cast<const char*>(h_b1_.data()), h_b1_.size() * sizeof(float));
     os.write(reinterpret_cast<const char*>(h_w2_.data()), h_w2_.size() * sizeof(float));
     os.write(reinterpret_cast<const char*>(h_b2_.data()), h_b2_.size() * sizeof(float));
     os.write(reinterpret_cast<const char*>(h_w3_.data()), h_w3_.size() * sizeof(float));
     os.write(reinterpret_cast<const char*>(h_b3_.data()), h_b3_.size() * sizeof(float));
+    os.write(reinterpret_cast<const char*>(h_w_pol_.data()), h_w_pol_.size() * sizeof(float));
+    os.write(reinterpret_cast<const char*>(h_b_pol_.data()), h_b_pol_.size() * sizeof(float));
     return true;
 }
 
@@ -525,6 +656,61 @@ Value NeuralGPU::evaluate(const Board& board, int worker_id) {
     }
 
     return contexts_[idx]->evaluate_single(board);
+}
+
+Value NeuralGPU::evaluate_dual(const Board& board, float* out_policy_4096, int worker_id) {
+    if (!initialized_ || contexts_.empty()) {
+        init(device_id_, max_batch_size_);
+    }
+
+    size_t idx = 0;
+    if (contexts_.size() > 1) {
+        if (worker_id >= 0) {
+            idx = static_cast<size_t>(worker_id) % contexts_.size();
+        } else {
+            idx = (round_robin_counter_.fetch_add(1)) % contexts_.size();
+        }
+    }
+
+    return contexts_[idx]->evaluate_dual(board, out_policy_4096);
+}
+
+void NeuralGPU::get_policy(const Board& board, std::vector<float>& out_logits, int worker_id) {
+    out_logits.resize(POLICY_DIM);
+    evaluate_dual(board, out_logits.data(), worker_id);
+}
+
+void NeuralGPU::get_move_probabilities(const Board& board, const std::vector<Move>& moves, std::vector<float>& out_probs, int worker_id) {
+    out_probs.assign(moves.size(), 0.0f);
+    if (moves.empty()) return;
+
+    std::vector<float> policy(POLICY_DIM);
+    evaluate_dual(board, policy.data(), worker_id);
+
+    std::vector<float> legal_logits(moves.size());
+    float max_logit = -1e9f;
+    for (size_t i = 0; i < moves.size(); ++i) {
+        int pol_idx = (static_cast<int>(moves[i].from_sq()) << 6) | static_cast<int>(moves[i].to_sq());
+        float l = policy[pol_idx];
+        if (moves[i].is_promotion() && moves[i].promotion_type() == QUEEN) {
+            l += 0.5f;
+        }
+        legal_logits[i] = l;
+        if (l > max_logit) max_logit = l;
+    }
+
+    float sum_exp = 0.0f;
+    for (size_t i = 0; i < moves.size(); ++i) {
+        float e = std::exp(legal_logits[i] - max_logit);
+        out_probs[i] = e;
+        sum_exp += e;
+    }
+
+    if (sum_exp > 0.0f) {
+        for (size_t i = 0; i < moves.size(); ++i) {
+            out_probs[i] /= sum_exp;
+        }
+    }
 }
 
 void NeuralGPU::evaluate_batch(const std::vector<Board>& boards, std::vector<Value>& out_scores) {

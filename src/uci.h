@@ -12,6 +12,7 @@ public:
 
     void loop();
     void handle_bench(int depth);
+    void handle_policy_cmd(const std::string& fen);
 
 private:
     void handle_uci();
@@ -25,6 +26,7 @@ private:
 
     void handle_perft(int depth);
     void handle_eval();
+    void handle_policy(const std::string& line);
     void handle_gpu_info();
 
     uint64_t perft(Board& b, int depth);

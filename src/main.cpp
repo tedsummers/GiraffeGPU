@@ -10,9 +10,22 @@ int main(int argc, char* argv[]) {
             std::cout << "GiraffeGPU - Neural Chess Engine running on NVIDIA GPUs\n";
             std::cout << "Based on the Giraffe Chess Engine by Matthew Lai\n\n";
             std::cout << "Usage:\n";
-            std::cout << "  ./GiraffeGPU           Launch UCI protocol mode\n";
-            std::cout << "  ./GiraffeGPU bench     Run benchmark suite\n";
-            std::cout << "  ./GiraffeGPU gpu-info  List detected NVIDIA GPUs\n";
+            std::cout << "  ./GiraffeGPU              Launch UCI protocol mode\n";
+            std::cout << "  ./GiraffeGPU bench        Run benchmark suite\n";
+            std::cout << "  ./GiraffeGPU policy [fen] Show Dual-Head Policy Network distribution\n";
+            std::cout << "  ./GiraffeGPU gpu-info     List detected NVIDIA GPUs\n";
+            return 0;
+        } else if (arg == "policy") {
+            std::string fen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+            if (argc > 2) {
+                fen = argv[2];
+                for (int i = 3; i < argc; ++i) {
+                    fen += " ";
+                    fen += argv[i];
+                }
+            }
+            UCI uci;
+            uci.handle_policy_cmd(fen);
             return 0;
         } else if (arg == "gpu-info") {
             auto devices = Neural::NeuralGPU::list_devices();

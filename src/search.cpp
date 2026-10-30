@@ -26,6 +26,7 @@ Search::Search()
     , pondering_(false)
     , nodes_(0)
     , ponder_enabled_(true)
+    , policy_net_enabled_(true)
     , num_threads_(2)
     , target_time_ms_(-1)
     , hard_limit_ms_(-1)
@@ -115,7 +116,7 @@ void Search::update_quiet_history(SearchWorker& w, const Board& board, Move best
     }
 }
 
-void Search::order_moves(const Board& board, const SearchWorker& w, std::vector<Move>& moves, Move tt_move, int ply) {
+void Search::order_moves(const Board& board, const SearchWorker& w, std::vector<Move>& moves, Move tt_move, int ply, const float* policy) {
     std::vector<std::pair<int, Move>> scored_moves;
     scored_moves.reserve(moves.size());
 
@@ -125,38 +126,45 @@ void Search::order_moves(const Board& board, const SearchWorker& w, std::vector<
 
     for (const auto& m : moves) {
         int score = 0;
+        int pol_idx = (static_cast<int>(m.from_sq()) << 6) | static_cast<int>(m.to_sq());
+        float pol_logit = (policy != nullptr) ? policy[pol_idx] : 0.0f;
+        if (policy != nullptr && m.is_promotion() && m.promotion_type() == QUEEN) {
+            pol_logit += 0.5f;
+        }
+        int pol_pts = (policy != nullptr) ? static_cast<int>(pol_logit * 5000.0f) : 0;
+
         if (m == tt_move) {
             score = 300000;
         } else if (board.piece_at(m.to_sq()) != NO_PIECE || m.is_en_passant() || m.is_promotion()) {
-            // Captures and Promotions: MVV-LVA + SEE
+            // Captures and Promotions: MVV-LVA + SEE + Policy
             Piece victim = board.piece_at(m.to_sq());
             Piece attacker = board.piece_at(m.from_sq());
             PieceType v_pt = (victim != NO_PIECE) ? piece_type(victim) : PAWN;
             PieceType a_pt = piece_type(attacker);
 
             if (m.is_promotion()) {
-                score = 150000 + SEE::PIECE_VALUES[m.promotion_type()];
+                score = 150000 + SEE::PIECE_VALUES[m.promotion_type()] + pol_pts;
             } else {
                 Value see_val = SEE::evaluate(board, m);
                 if (see_val >= 0) {
-                    score = 100000 + (SEE::PIECE_VALUES[v_pt] * 10) - SEE::PIECE_VALUES[a_pt] + see_val;
+                    score = 100000 + (SEE::PIECE_VALUES[v_pt] * 10) - SEE::PIECE_VALUES[a_pt] + see_val + (pol_pts / 2);
                 } else {
                     score = -50000 + see_val;
                 }
             }
         } else {
-            // Quiet moves: Killers -> Countermove -> Continuation History -> Main History
+            // Quiet moves: Killers -> Countermove -> Continuation History -> Main History + Policy
             if (ply < 128 && m == w.killer_moves[ply][0]) {
-                score = 90000;
+                score = 90000 + pol_pts;
             } else if (ply < 128 && m == w.killer_moves[ply][1]) {
-                score = 80000;
+                score = 80000 + pol_pts;
             } else if (m == cm) {
-                score = 75000;
+                score = 75000 + pol_pts;
             } else {
                 Piece p = board.piece_at(m.from_sq());
                 int h_score = w.history[p][m.to_sq()];
                 int ch_score = (prev_p != NO_PIECE) ? w.conthist[prev_p][prev_m.to_sq()][m.to_sq()] : 0;
-                score = h_score + ch_score * 2;
+                score = h_score + ch_score * 2 + pol_pts;
             }
         }
         scored_moves.emplace_back(score, m);
@@ -325,7 +333,14 @@ Value Search::pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha
         return VALUE_DRAW;
     }
 
-    order_moves(board, w, moves, tt_move, ply);
+    std::vector<float> policy_logits;
+    const float* pol_ptr = nullptr;
+    if (policy_net_enabled_ && (depth >= 3 || ply == 0)) {
+        Neural::g_neural_gpu.get_policy(board, policy_logits, w.id);
+        pol_ptr = policy_logits.data();
+    }
+
+    order_moves(board, w, moves, tt_move, ply, pol_ptr);
 
     Move best_move = MOVE_NONE;
     TTFlag flag = TT_UPPERBOUND;
@@ -357,6 +372,15 @@ Value Search::pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha
                 // Reduce less if cut node or in check
                 if (cut_node) reduction += 1;
                 if (board.gives_check(m)) reduction -= 1;
+
+                // Policy-guided reduction discount or penalty
+                if (pol_ptr) {
+                    int pol_idx = (static_cast<int>(m.from_sq()) << 6) | static_cast<int>(m.to_sq());
+                    float pol = pol_ptr[pol_idx];
+                    if (pol > 1.2f) reduction -= 1;
+                    else if (pol < -1.5f) reduction += 1;
+                }
+
                 reduction = std::max(0, std::min(depth - 2, reduction));
             }
 
@@ -498,6 +522,14 @@ void Search::search_root(Board& board) {
         std::cout << "bestmove 0000" << std::endl;
         return;
     }
+
+    std::vector<float> policy_logits;
+    const float* pol_ptr = nullptr;
+    if (policy_net_enabled_) {
+        Neural::g_neural_gpu.get_policy(board, policy_logits, 0);
+        pol_ptr = policy_logits.data();
+    }
+    order_moves(board, main_worker_, root_moves, MOVE_NONE, 0, pol_ptr);
     best_move = root_moves[0];
 
     bool single_reply = (root_moves.size() == 1) && !limits_.infinite && (limits_.depth == 64);
