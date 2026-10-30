@@ -1,9 +1,14 @@
 /*
   Copyright (c) 2011-2015 Ronald de Man
+  Copyright 2017-2018 Jon Dart
 */
 
 #ifndef TBCORE_H
 #define TBCORE_H
+
+#if defined(__cplusplus) && defined(TB_USE_ATOMIC)
+#include <atomic>
+#endif
 
 #ifndef _WIN32
 #include <pthread.h>
@@ -17,7 +22,16 @@
 #define FD_ERR INVALID_HANDLE_VALUE
 #endif
 
-#ifdef TB_HAVE_THREADS
+#ifndef TB_NO_THREADS
+#if defined(__cplusplus) && (__cplusplus >= 201103L)
+
+#include <mutex>
+#define LOCK_T std::mutex
+#define LOCK_INIT(x)
+#define LOCK(x) x.lock()
+#define UNLOCK(x) x.unlock()
+
+#else
 #ifndef _WIN32
 #define LOCK_T pthread_mutex_t
 #define LOCK_INIT(x) pthread_mutex_init(&(x), NULL)
@@ -29,7 +43,9 @@
 #define LOCK(x) WaitForSingleObject(x, INFINITE)
 #define UNLOCK(x) ReleaseMutex(x)
 #endif
-#else       /* !TB_HAVE_THREADS */
+
+#endif
+#else /* TB_NO_THREADS */
 #define LOCK_T          int
 #define LOCK_INIT(x)    /* NOP */
 #define LOCK(x)         /* NOP */
@@ -92,7 +108,11 @@ struct TBEntry_piece {
   char *data;
   uint64 key;
   uint64 mapping;
+#if defined(__cplusplus) && defined(TB_USE_ATOMIC)
+  std::atomic<ubyte> ready;
+#else
   ubyte ready;
+#endif
   ubyte num;
   ubyte symmetric;
   ubyte has_pawns;
@@ -107,7 +127,11 @@ struct TBEntry_pawn {
   char *data;
   uint64 key;
   uint64 mapping;
+#if defined(__cplusplus) && (__cplusplus >= 201103L)
+  std::atomic<ubyte> ready;
+#else
   ubyte ready;
+#endif
   ubyte num;
   ubyte symmetric;
   ubyte has_pawns;
