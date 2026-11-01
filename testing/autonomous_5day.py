@@ -303,6 +303,26 @@ def stop_daemon():
     except Exception as e:
         print(f"Error stopping process {pid}: {e}")
 
+def reset_saved_state():
+    """Archive stale autonomous state so the next run starts at Day 1."""
+    if os.path.exists(PID_FILE):
+        try:
+            with open(PID_FILE, "r") as f:
+                pid = int(f.read().strip())
+            os.kill(pid, 0)
+            raise RuntimeError(f"autonomous pipeline is still running with PID {pid}; stop it first")
+        except ProcessLookupError:
+            pass
+        except FileNotFoundError:
+            pass
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    for path, suffix in ((STATE_FILE, "state.json"), (PID_FILE, "pid")):
+        if os.path.exists(path):
+            archive = os.path.join(RESULTS_DIR, f"autonomous_{stamp}.{suffix}")
+            shutil.move(path, archive)
+            print(f"Archived {path} to {archive}")
+
 def main():
     parser = argparse.ArgumentParser(description="GiraffeGPU 5-Day Autonomous Improvement System")
     parser.add_argument("--start", action="store_true", help="Start the 5-day autonomous optimization pipeline")
@@ -310,9 +330,19 @@ def main():
     parser.add_argument("--status", action="store_true", help="Check live status of the running autonomous session")
     parser.add_argument("--stop", action="store_true", help="Gracefully stop the running autonomous session")
     parser.add_argument("--test-run", action="store_true", help="Run a fast 3-minute smoke test of the entire pipeline")
+    parser.add_argument("--fresh", action="store_true", help="Archive saved state and start again from Day 1")
     parser.add_argument("--duration-hours", type=int, default=120, help="Total duration in hours (default: 120)")
 
     args = parser.parse_args()
+
+    if args.fresh:
+        try:
+            reset_saved_state()
+        except RuntimeError as exc:
+            parser.error(str(exc))
+        if not (args.start or args.daemon or args.test_run):
+            print("Saved autonomous state archived. The next --start will begin at Day 1.")
+            return
 
     if args.status:
         print_status()
