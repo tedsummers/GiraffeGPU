@@ -32,6 +32,12 @@ void UCI::handle_uci() {
     std::cout << "option name BatchSize type spin default 512 min 1 max 4096" << std::endl;
     std::cout << "option name Ponder type check default true" << std::endl;
     std::cout << "option name PolicyNet type check default true" << std::endl;
+    std::cout << "option name AspirationWindow type spin default 32 min 1 max 1000" << std::endl;
+    std::cout << "option name NullMoveReduction type spin default 3 min 1 max 8" << std::endl;
+    std::cout << "option name LMRMovesThreshold type spin default 3 min 1 max 32" << std::endl;
+    std::cout << "option name LMRDepthThreshold type spin default 3 min 1 max 16" << std::endl;
+    std::cout << "option name ProbCutMargin type spin default 180 min 25 max 1000" << std::endl;
+    std::cout << "option name MoveOverhead type spin default 30 min 0 max 1000" << std::endl;
     std::cout << "option name SyzygyPath type string default <empty>" << std::endl;
     std::cout << "option name WeightsFile type string default eval.net" << std::endl;
     std::cout << "uciok" << std::endl;
@@ -40,6 +46,11 @@ void UCI::handle_uci() {
 void UCI::handle_isready() {
     if (!Neural::g_neural_gpu.is_initialized()) {
         Neural::g_neural_gpu.init(Neural::ALL_GPUS, 512);
+    }
+    if (!weights_loaded_ && Neural::g_neural_gpu.is_initialized()) {
+        // Match the advertised UCI default. If eval.net is absent, the neural
+        // implementation keeps its built-in safe defaults.
+        weights_loaded_ = Neural::g_neural_gpu.load_weights(weights_path_);
     }
     std::cout << "readyok" << std::endl;
 }
@@ -56,7 +67,7 @@ void UCI::handle_setoption(const std::string& line) {
         opt_name += token;
     }
 
-    iss >> val_str;
+    std::getline(iss >> std::ws, val_str);
 
     if (opt_name == "Hash") {
         try {
@@ -75,12 +86,14 @@ void UCI::handle_setoption(const std::string& line) {
             int dev = std::stoi(val_str);
             handle_stop();
             Neural::g_neural_gpu.init(dev, Neural::g_neural_gpu.max_batch_size());
+            weights_loaded_ = Neural::g_neural_gpu.load_weights(weights_path_);
         } catch (...) {}
     } else if (opt_name == "BatchSize") {
         try {
             int bs = std::stoi(val_str);
             handle_stop();
             Neural::g_neural_gpu.init(Neural::g_neural_gpu.current_device(), bs);
+            weights_loaded_ = Neural::g_neural_gpu.load_weights(weights_path_);
         } catch (...) {}
     } else if (opt_name == "Ponder") {
         bool enable = (val_str == "true" || val_str == "1");
@@ -90,14 +103,33 @@ void UCI::handle_setoption(const std::string& line) {
         bool enable = (val_str == "true" || val_str == "1");
         g_search.set_policy_net_enabled(enable);
         std::cout << "info string PolicyNet set to " << (enable ? "true" : "false") << std::endl;
+    } else if (opt_name == "AspirationWindow") {
+        try { g_search.set_aspiration_window(std::stoi(val_str)); } catch (...) {}
+    } else if (opt_name == "NullMoveReduction") {
+        try { g_search.set_null_move_reduction(std::stoi(val_str)); } catch (...) {}
+    } else if (opt_name == "LMRMovesThreshold") {
+        try { g_search.set_lmr_moves_threshold(std::stoi(val_str)); } catch (...) {}
+    } else if (opt_name == "LMRDepthThreshold") {
+        try { g_search.set_lmr_depth_threshold(std::stoi(val_str)); } catch (...) {}
+    } else if (opt_name == "ProbCutMargin") {
+        try { g_search.set_probcut_margin(std::stoi(val_str)); } catch (...) {}
+    } else if (opt_name == "MoveOverhead") {
+        try { g_search.set_move_overhead(std::stoi(val_str)); } catch (...) {}
     } else if (opt_name == "SyzygyPath") {
         g_search.set_syzygy_path(val_str);
         std::cout << "info string SyzygyPath set to " << val_str << " (TB_LARGEST=" << Syzygy::max_pieces() << ")" << std::endl;
     } else if (opt_name == "WeightsFile") {
-        if (Neural::g_neural_gpu.load_weights(val_str)) {
+        weights_path_ = val_str;
+        if (Neural::g_neural_gpu.is_initialized() && Neural::g_neural_gpu.load_weights(weights_path_)) {
+            weights_loaded_ = true;
             std::cout << "info string Loaded weights from " << val_str << std::endl;
         } else {
-            std::cout << "info string Failed to load weights from " << val_str << std::endl;
+            // The path can be set before isready; it will be loaded during
+            // initialization. Report failure only when loading was attempted.
+            if (Neural::g_neural_gpu.is_initialized()) {
+                weights_loaded_ = false;
+                std::cout << "info string Failed to load weights from " << val_str << std::endl;
+            }
         }
     }
 }

@@ -53,6 +53,7 @@ Examples:
     parser.add_argument("--compare", default=None, help="Baseline engine to compare against on EPD suite")
     parser.add_argument("--movetime", type=int, default=1000, help="Movetime per position/move in ms (default: 1000)")
     parser.add_argument("--depth", type=int, default=None, help="Fixed search depth")
+    parser.add_argument("--engine-options", default="", help="Comma-separated UCI options for EPD tests")
 
     parser.add_argument("--match", action="store_true", help="Run head-to-head match against engine2")
     parser.add_argument("--sprt", action="store_true", help="Run SPRT test against engine2")
@@ -65,9 +66,12 @@ Examples:
 
     parser.add_argument("--selfplay", action="store_true", help="Run self-play data generation")
     parser.add_argument("--train", action="store_true", help="Train dual-head neural network weights on selfplay data")
-    parser.add_argument("--epochs", type=int, default=3, help="Training epochs (default: 3)")
+    parser.add_argument("--epochs", type=int, default=5, help="Training epochs (default: 5)")
     parser.add_argument("--spsa", action="store_true", help="Run SPSA search parameter tuning")
     parser.add_argument("--iters", type=int, default=10, help="Iterations for SPSA tuning")
+    parser.add_argument("--spsa-games", type=int, default=8, help="Games per SPSA perturbation match")
+    parser.add_argument("--selfplay-games", type=int, default=100, help="Self-play games for automatic weight training")
+    parser.add_argument("--no-train-weights", action="store_true", help="Skip neural-weight training after SPSA")
 
     args = parser.parse_args()
 
@@ -115,8 +119,13 @@ Examples:
         sub_args = [
             "--engine", args.engine,
             "--iters", str(args.iters),
-            "--tc", args.tc
+            "--tc", args.tc,
+            "--games", str(args.spsa_games),
+            "--selfplay-games", str(args.selfplay_games),
+            "--epochs", str(args.epochs)
         ]
+        if args.no_train_weights:
+            sub_args.append("--no-train-weights")
         sys.exit(run_cmd("tune_spsa.py", sub_args))
 
     else:
@@ -128,11 +137,18 @@ Examples:
             suite_file = args.epd
         
         epd_path = os.path.join(TESTING_DIR, "epd", suite_file) if not os.path.isabs(suite_file) else suite_file
-        sub_args = ["--epd", epd_path, "--engine", args.engine, "--movetime", str(args.movetime)]
+        sub_args = ["--epd", epd_path, "--engine", args.engine]
+        # run_epd prioritizes movetime when both are supplied. Do not pass the
+        # default clock alongside --depth, otherwise fixed-depth tests silently
+        # become time-based tests.
+        if args.depth is None:
+            sub_args.extend(["--movetime", str(args.movetime)])
         if args.compare:
             sub_args.extend(["--compare", args.compare])
         if args.depth:
             sub_args.extend(["--depth", str(args.depth)])
+        if args.engine_options:
+            sub_args.extend(["--engine-options", args.engine_options])
         sys.exit(run_cmd("run_epd.py", sub_args))
 
 if __name__ == "__main__":

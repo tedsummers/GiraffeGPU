@@ -28,6 +28,12 @@ Search::Search()
     , ponder_enabled_(true)
     , policy_net_enabled_(true)
     , num_threads_(2)
+    , aspiration_window_(32)
+    , null_move_reduction_(3)
+    , lmr_moves_threshold_(3)
+    , lmr_depth_threshold_(3)
+    , probcut_margin_(180)
+    , move_overhead_ms_(30)
     , target_time_ms_(-1)
     , hard_limit_ms_(-1)
 {
@@ -60,9 +66,15 @@ void Search::ponderhit() {
 
 bool Search::check_time() {
     if (stop_flag_.load(std::memory_order_relaxed)) return true;
+    if (limits_.nodes > 0 && nodes_.load(std::memory_order_relaxed) >= static_cast<uint64_t>(limits_.nodes)) {
+        stop_flag_.store(true, std::memory_order_relaxed);
+        return true;
+    }
     if (pondering_.load(std::memory_order_relaxed)) return false;
 
-    if ((nodes_.load(std::memory_order_relaxed) & 1023) == 0 && hard_limit_ms_ > 0) {
+    // GPU evaluation and OS scheduling can make a 1024-node polling interval
+    // overshoot a short clock. Poll frequently enough for fast time controls.
+    if ((nodes_.load(std::memory_order_relaxed) & 63) == 0 && hard_limit_ms_ > 0) {
         auto now = std::chrono::steady_clock::now();
         int64_t elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time_).count();
         if (elapsed >= hard_limit_ms_) {
@@ -77,6 +89,14 @@ bool Search::check_time() {
 static inline void update_history_score(int& score, int bonus) {
     constexpr int MAX_HISTORY = 16384;
     score += bonus - (score * std::abs(bonus)) / MAX_HISTORY;
+    score = std::max(-MAX_HISTORY, std::min(MAX_HISTORY, score));
+}
+
+static inline void update_history_score(int16_t& score, int bonus) {
+    constexpr int MAX_HISTORY = 16384;
+    int value = static_cast<int>(score);
+    value += bonus - (value * std::abs(bonus)) / MAX_HISTORY;
+    score = static_cast<int16_t>(std::max(-MAX_HISTORY, std::min(MAX_HISTORY, value)));
 }
 
 void Search::update_quiet_history(SearchWorker& w, const Board& board, Move best_quiet,
@@ -93,9 +113,10 @@ void Search::update_quiet_history(SearchWorker& w, const Board& board, Move best
         Move prev_m = w.move_stack[ply - 1];
         // Note: prev piece is retrieved at prev_m.to_sq()
         Piece prev_p = board.piece_at(prev_m.to_sq());
-        if (prev_p != NO_PIECE) {
+        Piece curr_p = board.piece_at(best_quiet.from_sq());
+        if (prev_p != NO_PIECE && curr_p != NO_PIECE) {
             w.countermove[prev_p][prev_m.to_sq()] = best_quiet;
-            update_history_score(w.conthist[prev_p][prev_m.to_sq()][best_quiet.to_sq()], bonus);
+            update_history_score(w.conthist[prev_p][prev_m.to_sq()][curr_p][best_quiet.to_sq()], bonus);
         }
     }
 
@@ -110,7 +131,9 @@ void Search::update_quiet_history(SearchWorker& w, const Board& board, Move best
             Move prev_m = w.move_stack[ply - 1];
             Piece prev_p = board.piece_at(prev_m.to_sq());
             if (prev_p != NO_PIECE) {
-                update_history_score(w.conthist[prev_p][prev_m.to_sq()][m.to_sq()], malus);
+                Piece curr_p = board.piece_at(m.from_sq());
+                if (curr_p != NO_PIECE)
+                    update_history_score(w.conthist[prev_p][prev_m.to_sq()][curr_p][m.to_sq()], malus);
             }
         }
     }
@@ -163,7 +186,9 @@ void Search::order_moves(const Board& board, const SearchWorker& w, std::vector<
             } else {
                 Piece p = board.piece_at(m.from_sq());
                 int h_score = w.history[p][m.to_sq()];
-                int ch_score = (prev_p != NO_PIECE) ? w.conthist[prev_p][prev_m.to_sq()][m.to_sq()] : 0;
+                Piece curr_p = board.piece_at(m.from_sq());
+                int ch_score = (prev_p != NO_PIECE && curr_p != NO_PIECE)
+                    ? w.conthist[prev_p][prev_m.to_sq()][curr_p][m.to_sq()] : 0;
                 score = h_score + ch_score * 2 + pol_pts;
             }
         }
@@ -179,11 +204,12 @@ void Search::order_moves(const Board& board, const SearchWorker& w, std::vector<
     }
 }
 
-Value Search::qsearch(Board& board, SearchWorker& w, int ply, Value alpha, Value beta) {
+Value Search::qsearch(Board& board, SearchWorker& w, int ply, Value alpha, Value beta, int qply) {
     if (check_time()) return VALUE_ZERO;
 
     nodes_++;
     if (ply > w.seldepth) w.seldepth = ply;
+    if (ply >= 127) return Neural::g_neural_gpu.evaluate(board, w.id);
 
     if (board.is_draw()) return VALUE_DRAW;
 
@@ -204,16 +230,15 @@ Value Search::qsearch(Board& board, SearchWorker& w, int ply, Value alpha, Value
         // Generate captures and promotions
         board.generate_captures(moves);
 
-        // Quiescence improvement: Include quiet checks when within 2 plies of root
-        if (ply <= 2) {
-            std::vector<Move> all_moves;
-            board.generate_legal_moves(all_moves);
+        // Quiet checks are useful near the qsearch root, but allowing them at
+        // every qsearch ply causes a large checking-tree explosion. Captures
+        // and promotions remain available at every qsearch ply.
+        std::vector<Move> all_moves;
+        board.generate_legal_moves(all_moves);
+        if (qply < 2) {
             for (const auto& m : all_moves) {
-                if (board.piece_at(m.to_sq()) == NO_PIECE && !m.is_promotion()) {
-                    if (board.gives_check(m)) {
-                        moves.push_back(m);
-                    }
-                }
+                if (board.piece_at(m.to_sq()) == NO_PIECE && !m.is_promotion() && board.gives_check(m))
+                    moves.push_back(m);
             }
         }
     }
@@ -228,7 +253,7 @@ Value Search::qsearch(Board& board, SearchWorker& w, int ply, Value alpha, Value
         w.move_stack[ply] = m;
         if (!board.make_move(m)) continue;
 
-        Value score = -qsearch(board, w, ply + 1, -beta, -alpha);
+        Value score = -qsearch(board, w, ply + 1, -beta, -alpha, qply + 1);
         board.unmake_move(m);
 
         if (stop_flag_.load()) return VALUE_ZERO;
@@ -257,7 +282,7 @@ Value Search::pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha
     if (in_check) depth++;
 
     if (depth <= 0) {
-        return qsearch(board, w, ply, alpha, beta);
+        return qsearch(board, w, ply, alpha, beta, 0);
     }
 
     nodes_++;
@@ -289,7 +314,7 @@ Value Search::pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha
          board.piece_count(W_ROOK)  + board.piece_count(B_ROOK) > 0))
     {
         board.make_null_move();
-        int R = 3 + depth / 4;
+        int R = null_move_reduction_ + depth / 4;
         Value null_score = -pvs(board, w, depth - 1 - R, ply + 1, -beta, -beta + 1, !cut_node);
         board.unmake_null_move();
 
@@ -300,7 +325,7 @@ Value Search::pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha
 
     // 4. ProbCut (Pruning non-tactical branches if shallow capture search easily beats beta + threshold)
     if (!in_check && depth >= 5 && std::abs(beta) < VALUE_MATE_THRESHOLD) {
-        Value probcut_beta = beta + 180;
+        Value probcut_beta = beta + probcut_margin_;
         int probcut_depth = depth - 4;
 
         std::vector<Move> captures;
@@ -312,7 +337,7 @@ Value Search::pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha
             w.move_stack[ply] = cm;
             if (!board.make_move(cm)) continue;
 
-            Value score = -qsearch(board, w, ply + 1, -probcut_beta, -probcut_beta + 1);
+            Value score = -qsearch(board, w, ply + 1, -probcut_beta, -probcut_beta + 1, 0);
             if (score >= probcut_beta) {
                 score = -pvs(board, w, probcut_depth, ply + 1, -probcut_beta, -probcut_beta + 1, !cut_node);
             }
@@ -347,10 +372,15 @@ Value Search::pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha
     Value best_score = -VALUE_INFINITE;
     int moves_searched = 0;
     std::vector<Move> quiet_moves_tried;
+    bool history_updated_on_cutoff = false;
 
     for (const auto& m : moves) {
         bool is_capture = (board.piece_at(m.to_sq()) != NO_PIECE) || m.is_en_passant();
         bool is_quiet = !is_capture && !m.is_promotion();
+        // gives_check() evaluates a move in the parent position. Compute it
+        // before make_move; doing this in the child position misclassifies
+        // checking moves and applies the wrong LMR reduction.
+        bool gives_check = is_quiet && board.gives_check(m);
 
         w.move_stack[ply] = m;
         if (!board.make_move(m)) continue;
@@ -364,14 +394,14 @@ Value Search::pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha
         } else {
             // Systematic Late Move Reductions (LMR)
             int reduction = 0;
-            if (depth >= 3 && moves_searched > 3 && is_quiet && !in_check) {
+            if (depth >= lmr_depth_threshold_ && moves_searched > lmr_moves_threshold_ && is_quiet && !in_check) {
                 int d_idx = std::min(depth, 63);
                 int m_idx = std::min(moves_searched, 63);
                 reduction = LMR_TABLE[d_idx][m_idx];
 
                 // Reduce less if cut node or in check
                 if (cut_node) reduction += 1;
-                if (board.gives_check(m)) reduction -= 1;
+                if (gives_check) reduction -= 1;
 
                 // Policy-guided reduction discount or penalty
                 if (pol_ptr) {
@@ -424,11 +454,19 @@ Value Search::pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha
                             w.killer_moves[ply][0] = m;
                         }
                         update_quiet_history(w, board, m, quiet_moves_tried, depth, ply);
+                        history_updated_on_cutoff = true;
                     }
                     break;
                 }
             }
         }
+    }
+
+    // Also learn from principal-variation nodes. Restricting updates to
+    // cutoffs leaves history tables cold in quiet positions.
+    if (!history_updated_on_cutoff && !best_move.is_null() && !best_move.is_promotion() &&
+        board.piece_at(best_move.to_sq()) == NO_PIECE) {
+        update_quiet_history(w, board, best_move, quiet_moves_tried, depth, ply);
     }
 
     if (!stop_flag_.load()) {
@@ -463,20 +501,27 @@ void Search::start(Board& board, const SearchLimits& limits) {
         target_time_ms_ = -1;
         hard_limit_ms_ = -1;
     } else if (limits_.movetime > 0) {
-        hard_limit_ms_ = std::max(int64_t(10), limits_.movetime - 15);
-        target_time_ms_ = std::max(int64_t(10), limits_.movetime - 30);
+        // Reserve time for GPU synchronization, output, and scheduler
+        // latency. A fixed 15 ms margin is unsafe for short movetimes.
+        int64_t safety = std::max(int64_t(move_overhead_ms_),
+                                  std::max(int64_t(20), std::min(int64_t(250), limits_.movetime / 10)));
+        hard_limit_ms_ = std::max(int64_t(5), limits_.movetime - safety);
+        target_time_ms_ = std::max(int64_t(3), limits_.movetime - 2 * safety);
     } else {
         int64_t my_time = (board.side_to_move() == WHITE) ? limits_.wtime : limits_.btime;
         int64_t my_inc  = (board.side_to_move() == WHITE) ? limits_.winc  : limits_.binc;
 
         if (my_time > 0) {
             int moves_left = (limits_.movestogo > 0) ? std::min(limits_.movestogo, 50) : 30;
-            int64_t target = (my_time / moves_left) + (my_inc * 4 / 5);
-            int64_t max_allowed = std::min(static_cast<int64_t>(my_time * 0.4), my_time - 50);
-            int64_t hard = std::min(target * 3, max_allowed);
-
-            target_time_ms_ = std::max(int64_t(10), target);
-            hard_limit_ms_ = std::max(target_time_ms_, hard);
+            int64_t safety = std::max(int64_t(move_overhead_ms_),
+                                      std::max(int64_t(100), std::min(int64_t(1000), my_time / 20)));
+            int64_t available = std::max(int64_t(1), my_time - safety);
+            int64_t allocation = (my_time / moves_left) + (my_inc * 3 / 4);
+            target_time_ms_ = std::max(int64_t(1),
+                                       std::min(available, std::max(int64_t(3), allocation)));
+            // Hard limit is capped below the remaining clock so a delayed GPU
+            // completion cannot consume the entire clock.
+            hard_limit_ms_ = std::max(target_time_ms_, std::min(available, target_time_ms_ * 2));
         }
     }
 
@@ -537,11 +582,18 @@ void Search::search_root(Board& board) {
     int64_t prev_elapsed = 0;
 
     for (int depth = 1; depth <= max_depth; ++depth) {
+        if (target_time_ms_ > 0) {
+            auto now = std::chrono::steady_clock::now();
+            int64_t elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time_).count();
+            if (elapsed >= target_time_ms_) break;
+        }
         Value alpha = -VALUE_INFINITE;
         Value beta  = VALUE_INFINITE;
 
-        // Systematic Aspiration Window: expands progressively (+/- 25, 60, 150, inf)
-        int delta = 25;
+        // Use a narrow window once the score is stable, then widen both sides
+        // geometrically after a fail. The full-window fallback guarantees
+        // progress in tactical/mate-score positions.
+        int delta = (depth < 8) ? aspiration_window_ : std::max(8, aspiration_window_ / 2);
         if (depth >= 4) {
             alpha = std::max(-VALUE_INFINITE, best_score - delta);
             beta  = std::min(VALUE_INFINITE, best_score + delta);
@@ -553,10 +605,12 @@ void Search::search_root(Board& board) {
         while (!stop_flag_.load()) {
             if (score <= alpha) {
                 alpha = std::max(-VALUE_INFINITE, alpha - delta);
+                beta = std::min(VALUE_INFINITE, best_score + delta);
                 delta *= 2;
                 score = pvs(board, main_worker_, depth, 0, alpha, beta, false);
             } else if (score >= beta) {
                 beta = std::min(VALUE_INFINITE, beta + delta);
+                alpha = std::max(-VALUE_INFINITE, best_score - delta);
                 delta *= 2;
                 score = pvs(board, main_worker_, depth, 0, alpha, beta, false);
             } else {

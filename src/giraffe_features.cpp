@@ -18,8 +18,7 @@ static inline float norm_count(int x, float max_val) {
     return static_cast<float>(x) / max_val;
 }
 
-bool AttackMaps::is_safe(PieceType pt, Square sq) const {
-    Color c = (pt <= 6) ? WHITE : BLACK;
+bool AttackMaps::is_safe(PieceType pt, Color c, Square sq) const {
     PieceType oppAtk = (c == WHITE) ? blackLVA[sq] : whiteLVA[sq];
     PieceType friendAtk = (c == WHITE) ? whiteLVA[sq] : blackLVA[sq];
     uint8_t numFriend = (c == WHITE) ? whiteNumAtk[sq] : blackNumAtk[sq];
@@ -146,7 +145,8 @@ static void push_pawns_for_color(FeatureWriter& w, const Board& board, Color c, 
     }
 }
 
-static void push_sliding_attacks(FeatureWriter& w, const Board& board, Square sq, PieceType pt, bool exists, const AttackMaps& maps) {
+static void push_sliding_attacks(FeatureWriter& w, const Board& board, Square sq, PieceType pt,
+                                 Color c, bool exists, const AttackMaps& maps) {
     int safe_moves = 0;
     int f_start = square_file(sq);
     int r_start = square_rank(sq);
@@ -162,7 +162,7 @@ static void push_sliding_attacks(FeatureWriter& w, const Board& board, Square sq
             while (f >= 0 && f <= 7 && r >= 0 && r <= 7 && exists) {
                 count++;
                 Square s = make_square(static_cast<File>(f), static_cast<Rank>(r));
-                if (maps.is_safe(pt, s)) safe_moves++;
+                if (maps.is_safe(pt, c, s)) safe_moves++;
                 if (board.piece_at(s) != NO_PIECE) break;
                 f += df[dir];
                 r += dr[dir];
@@ -182,7 +182,7 @@ static void push_sliding_attacks(FeatureWriter& w, const Board& board, Square sq
             while (f >= 0 && f <= 7 && r >= 0 && r <= 7 && exists) {
                 count++;
                 Square s = make_square(static_cast<File>(f), static_cast<Rank>(r));
-                if (maps.is_safe(pt, s)) safe_moves++;
+                if (maps.is_safe(pt, c, s)) safe_moves++;
                 if (board.piece_at(s) != NO_PIECE) break;
                 f += df[dir];
                 r += dr[dir];
@@ -200,7 +200,7 @@ static void push_sliding_attacks(FeatureWriter& w, const Board& board, Square sq
             int r = r_start + dr[i];
             if (f >= 0 && f <= 7 && r >= 0 && r <= 7 && exists) {
                 Square s = make_square(static_cast<File>(f), static_cast<Rank>(r));
-                if (maps.is_safe(pt, s)) safe_moves++;
+                if (maps.is_safe(pt, c, s)) safe_moves++;
             }
         }
     }
@@ -236,12 +236,12 @@ static void push_pair_pieces(FeatureWriter& w, const Board& board, PieceType pt,
 
     // First piece
     w.push_coords(firstExists, firstSq);
-    push_sliding_attacks(w, board, firstSq, pt, firstExists, maps);
+    push_sliding_attacks(w, board, firstSq, pt, c, firstExists, maps);
     w.push_threat(firstSq, firstExists, maps);
 
     // Second piece
     w.push_coords(secondExists, secondSq);
-    push_sliding_attacks(w, board, secondSq, pt, secondExists, maps);
+    push_sliding_attacks(w, board, secondSq, pt, c, secondExists, maps);
     w.push_threat(secondSq, secondExists, maps);
 }
 
@@ -287,7 +287,7 @@ void extract_features(const Board& board, float* out_features) {
     bool wQExists = (wQueens != 0);
     Square wQSq = wQExists ? lsb(wQueens) : SQ_NONE;
     w.push_coords(wQExists, wQSq);
-    push_sliding_attacks(w, board, wQSq, QUEEN, wQExists, maps);
+    push_sliding_attacks(w, board, wQSq, QUEEN, WHITE, wQExists, maps);
     w.push_threat(wQSq, wQExists, maps);
 
     // Black Queen
@@ -295,7 +295,7 @@ void extract_features(const Board& board, float* out_features) {
     bool bQExists = (bQueens != 0);
     Square bQSq = bQExists ? lsb(bQueens) : SQ_NONE;
     w.push_coords(bQExists, bQSq);
-    push_sliding_attacks(w, board, bQSq, QUEEN, bQExists, maps);
+    push_sliding_attacks(w, board, bQSq, QUEEN, BLACK, bQExists, maps);
     w.push_threat(bQSq, bQExists, maps);
 
     // 4. Rooks

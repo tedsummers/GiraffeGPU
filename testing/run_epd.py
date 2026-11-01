@@ -16,9 +16,10 @@ import re
 from datetime import datetime
 
 class UCIEngine:
-    def __init__(self, engine_path, name="Engine"):
+    def __init__(self, engine_path, name="Engine", options=None):
         self.engine_path = os.path.abspath(engine_path)
         self.name = name
+        self.options = options or {}
         self.process = None
 
     def start(self):
@@ -34,6 +35,8 @@ class UCIEngine:
         )
         self.send("uci")
         self.wait_for("uciok", timeout=5.0)
+        for name, value in self.options.items():
+            self.send(f"setoption name {name} value {value}")
         self.send("isready")
         self.wait_for("readyok", timeout=10.0)
 
@@ -59,10 +62,12 @@ class UCIEngine:
         self.wait_for("readyok", timeout=5.0)
 
         cmd = "go"
-        if movetime is not None:
-            cmd += f" movetime {movetime}"
-        elif depth is not None:
+        # Fixed depth must take precedence over the parser's default movetime;
+        # otherwise --depth silently runs a 1-second search.
+        if depth is not None:
             cmd += f" depth {depth}"
+        elif movetime is not None:
+            cmd += f" movetime {movetime}"
         else:
             cmd += " movetime 1000"
 
@@ -180,12 +185,12 @@ def normalize_move(move_str):
     m = move_str.replace("+", "").replace("#", "").replace("x", "").replace("=", "").strip().lower()
     return m
 
-def run_suite(epd_path, engine_path, movetime=None, depth=None, max_positions=None):
+def run_suite(epd_path, engine_path, movetime=None, depth=None, max_positions=None, options=None):
     if not os.path.exists(epd_path):
         print(f"Error: EPD file not found: {epd_path}")
         return None
 
-    engine = UCIEngine(engine_path, name=os.path.basename(engine_path))
+    engine = UCIEngine(engine_path, name=os.path.basename(engine_path), options=options)
     engine.start()
 
     positions = []
@@ -324,6 +329,7 @@ def main():
     parser.add_argument("--movetime", type=int, default=1000, help="Search time per position in ms (default: 1000)")
     parser.add_argument("--depth", type=int, default=None, help="Fixed depth per position")
     parser.add_argument("--max", type=int, default=None, help="Max positions to run")
+    parser.add_argument("--engine-options", default="", help="Comma-separated UCI options")
 
     args = parser.parse_args()
 
@@ -331,12 +337,18 @@ def main():
     base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     epd_path = args.epd if os.path.isabs(args.epd) else os.path.join(base_dir, args.epd)
     engine_path = args.engine if os.path.isabs(args.engine) else os.path.join(base_dir, args.engine)
+    options = {}
+    for item in args.engine_options.split(","):
+        if "=" in item:
+            name, value = item.split("=", 1)
+            options[name.strip()] = value.strip()
 
     if args.compare:
         compare_path = args.compare if os.path.isabs(args.compare) else os.path.join(base_dir, args.compare)
         compare_engines(epd_path, engine_path, compare_path, movetime=args.movetime)
     else:
-        run_suite(epd_path, engine_path, movetime=args.movetime, depth=args.depth, max_positions=args.max)
+        run_suite(epd_path, engine_path, movetime=args.movetime, depth=args.depth,
+                  max_positions=args.max, options=options)
 
 if __name__ == "__main__":
     main()

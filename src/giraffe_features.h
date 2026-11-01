@@ -17,7 +17,7 @@ struct AttackMaps {
     float whiteCtrl[64];
     float blackCtrl[64];
 
-    bool is_safe(PieceType pt, Square sq) const;
+    bool is_safe(PieceType pt, Color color, Square sq) const;
 };
 
 void compute_attack_maps(const Board& board, AttackMaps& maps);

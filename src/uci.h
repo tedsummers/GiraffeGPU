@@ -33,6 +33,8 @@ private:
 
     Board board_;
     std::thread search_thread_;
+    std::string weights_path_ = "eval.net";
+    bool weights_loaded_ = false;
 };
 
 #endif // UCI_H

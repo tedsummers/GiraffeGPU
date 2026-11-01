@@ -85,7 +85,12 @@ class AutonomousPipeline:
     def step_spsa_tuning(self):
         log(">> [Day 1 Focus] Executing SPSA search parameter tuning...")
         iters = 2 if self.quick_test else 10
-        cmd = [sys.executable, os.path.join(TESTING_DIR, "tune_spsa.py"), "--iters", str(iters), "--tc", "3+0.05"]
+        cmd = [
+            sys.executable, os.path.join(TESTING_DIR, "tune_spsa.py"),
+            "--iters", str(iters), "--games", "8", "--tc", "3+0.05",
+            "--selfplay-games", "2" if self.quick_test else "25",
+            "--epochs", "2" if self.quick_test else "5",
+        ]
         subprocess.run(cmd, cwd=REPO_DIR)
 
     def step_selfplay(self, games_count):
@@ -94,7 +99,9 @@ class AutonomousPipeline:
         cmd = [
             sys.executable, os.path.join(TESTING_DIR, "self_play.py"),
             "--games", str(games_count),
-            "--movetime", str(movetime)
+            "--movetime", str(movetime),
+            "--random-plies", "8",
+            "--engine-options", "PolicyNet=false"
         ]
         subprocess.run(cmd, cwd=REPO_DIR)
         self.state["total_selfplay_games"] += games_count
@@ -111,7 +118,10 @@ class AutonomousPipeline:
             "--data", dataset_path,
             "--in-weights", active_weights,
             "--out-weights", candidate_weights,
-            "--epochs", str(epochs)
+            "--epochs", str(epochs),
+            "--lr", "0.00025",
+            "--max-output-delta", "0.02",
+            "--seed", "1337"
         ]
         subprocess.run(cmd, cwd=REPO_DIR)
         return candidate_weights
@@ -123,20 +133,32 @@ class AutonomousPipeline:
         if not os.path.exists(baseline_engine):
             shutil.copy(os.path.join(REPO_DIR, "GiraffeGPU"), baseline_engine)
 
-        games = 2 if self.quick_test else 20
+        search_options = ""
+        search_options_path = os.path.join(RESULTS_DIR, "best_search_options.txt")
+        if os.path.exists(search_options_path):
+            with open(search_options_path, "r") as f:
+                search_options = f.read().strip()
+        common_options = "PolicyNet=false"
+        if search_options:
+            common_options += "," + search_options
+        candidate_options = f"WeightsFile={candidate_weights},{common_options}"
+
+        # Quick mode is diagnostic only and must never promote a network.
+        games = 4 if self.quick_test else 200
         cmd = [
             sys.executable, os.path.join(TESTING_DIR, "match_sprt.py"),
             "--engine1", os.path.join(REPO_DIR, "GiraffeGPU"),
             "--engine2", baseline_engine,
-            "--engine1-options", f"WeightsFile={candidate_weights}",
+            "--engine1-options", candidate_options,
+            "--engine2-options", f"WeightsFile={os.path.join(REPO_DIR, 'eval.net')},{common_options}",
             "--games", str(games),
-            "--tc", "2+0.05",
+            "--tc", "3+0.05",
             "--sprt"
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_DIR)
         output = proc.stdout
 
-        accepted = ("ACCEPTED" in output) or (self.quick_test)
+        accepted = ("SPRT Early Stop: ACCEPTED" in output) and not self.quick_test
         if accepted:
             log(">>> PROMOTED: Candidate demonstrated positive Elo! Deploying candidate.net to eval.net.")
             shutil.copy(candidate_weights, os.path.join(REPO_DIR, "eval.net"))

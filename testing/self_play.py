@@ -14,6 +14,11 @@ import json
 import argparse
 from datetime import datetime
 
+try:
+    import chess
+except ImportError:
+    chess = None
+
 def resolve_engine_path(p):
     if os.path.isabs(p): return p
     if os.path.exists(p): return os.path.abspath(p)
@@ -25,9 +30,10 @@ def resolve_engine_path(p):
     return os.path.abspath(p)
 
 class UCIEngineInstance:
-    def __init__(self, engine_path, device_id=-1):
+    def __init__(self, engine_path, device_id=-1, engine_options=None):
         self.engine_path = resolve_engine_path(engine_path)
         self.device_id = device_id
+        self.engine_options = engine_options or {}
         self.process = subprocess.Popen(
             [self.engine_path],
             stdin=subprocess.PIPE,
@@ -38,6 +44,8 @@ class UCIEngineInstance:
         )
         self.send("uci")
         self.wait_for("uciok")
+        for name, value in self.engine_options.items():
+            self.send(f"setoption name {name} value {value}")
         if self.device_id >= 0:
             self.send(f"setoption name Device_GPU value {self.device_id}")
         self.send("isready")
@@ -98,22 +106,32 @@ class UCIEngineInstance:
 # Built-in lightweight move validator / generator using python-chess if available,
 # or falling back to engine's own legal move responses.
 def get_random_opening(engine, plies=6):
-    # Standard initial moves
-    common_openings = [
-        ["e2e4", "e7e5", "g1f3", "b8c6", "f1b5", "a7a6"],
-        ["d2d4", "d7d5", "c2c4", "e7e6", "b1c3", "g8f6"],
-        ["e2e4", "c7c5", "g1f3", "d7d6", "d2d4", "c5d4"],
-        ["e2e4", "e7e6", "d2d4", "d7d5", "b1c3", "g8f6"],
-        ["c2c4", "g8f6", "b1c3", "e7e6", "e2e4", "d7d5"],
-        ["g1f3", "d7d5", "g2g3", "g8f6", "f1g2", "c7c6"],
-        ["e2e4", "c7c6", "d2d4", "d7d5", "b1c3", "d5e4"]
-    ]
-    return random.choice(common_openings)[:plies]
+    """Create a legal, varied opening instead of reusing a tiny fixed book."""
+    board = chess.Board()
+    moves = []
+    for _ in range(max(0, plies)):
+        legal = list(board.legal_moves)
+        if not legal:
+            break
+        # Keep the first move sensible while allowing broad opening coverage.
+        if not moves:
+            preferred = [m for m in legal if board.san(m) in ("e4", "d4", "Nf3", "c4")]
+            move = random.choice(preferred or legal)
+        else:
+            move = random.choice(legal)
+        moves.append(move.uci())
+        board.push(move)
+    return moves
 
-def play_selfplay_game(engine_path, movetime=100, random_plies=4, max_moves=100):
-    engine = UCIEngineInstance(engine_path)
+def play_selfplay_game(engine_path, movetime=100, random_plies=6, max_moves=100, engine_options=None):
+    if chess is None:
+        raise RuntimeError("python-chess is required for self-play dataset generation")
+    engine = UCIEngineInstance(engine_path, engine_options=engine_options)
 
     moves_history = get_random_opening(engine, plies=random_plies)
+    board = chess.Board()
+    for opening_move in moves_history:
+        board.push_uci(opening_move)
     game_positions = []
 
     # Play out moves
@@ -121,6 +139,7 @@ def play_selfplay_game(engine_path, movetime=100, random_plies=4, max_moves=100)
     res_val = 0.5
 
     for ply in range(len(moves_history), max_moves * 2):
+        position_fen = board.fen()
         moves_str = " ".join(moves_history)
         engine.send(f"position startpos moves {moves_str}")
         engine.send("isready")
@@ -163,6 +182,7 @@ def play_selfplay_game(engine_path, movetime=100, random_plies=4, max_moves=100)
 
         game_positions.append({
             "ply": ply,
+            "fen": position_fen,
             "side": "W" if ply % 2 == 0 else "B",
             "move": best_move,
             "eval_cp": eval_score,
@@ -170,6 +190,7 @@ def play_selfplay_game(engine_path, movetime=100, random_plies=4, max_moves=100)
         })
 
         moves_history.append(best_move)
+        board.push_uci(best_move)
 
         # Adjudicate extreme evaluations
         if eval_score > 900:
@@ -200,12 +221,24 @@ def main():
     parser.add_argument("--games", type=int, default=10, help="Number of games to generate")
     parser.add_argument("--movetime", type=int, default=100, help="Search movetime in ms (default: 100)")
     parser.add_argument("--output", default="testing/results/selfplay_dataset.jsonl", help="Output file (.jsonl)")
+    parser.add_argument("--engine-options", default="", help="Comma-separated UCI options")
+    parser.add_argument("--random-plies", type=int, default=6, help="Legal random opening plies (default: 6)")
+    parser.add_argument("--max-moves", type=int, default=100, help="Maximum full moves per game")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible openings")
 
     args = parser.parse_args()
+    if args.seed is not None:
+        random.seed(args.seed)
 
     repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     output_path = args.output if os.path.isabs(args.output) else os.path.join(repo_dir, args.output)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    engine_options = {}
+    for item in args.engine_options.split(","):
+        if "=" in item:
+            name, value = item.split("=", 1)
+            engine_options[name.strip()] = value.strip()
 
     print(f"\n=======================================================")
     print(f"Starting Self-Play Generation: {args.games} games")
@@ -220,13 +253,17 @@ def main():
     with open(output_path, "a") as f_out:
         for g in range(1, args.games + 1):
             g_start = time.time()
-            game_data = play_selfplay_game(args.engine, movetime=args.movetime)
+            game_data = play_selfplay_game(args.engine, movetime=args.movetime,
+                                           random_plies=args.random_plies,
+                                           max_moves=args.max_moves,
+                                           engine_options=engine_options)
             g_time = time.time() - g_start
 
             for pos in game_data["positions"]:
                 record = {
                     "game_id": g,
                     "ply": pos["ply"],
+                    "fen": pos["fen"],
                     "side": pos["side"],
                     "move": pos["move"],
                     "eval_cp": pos["eval_cp"],

@@ -36,12 +36,12 @@
   - **Policy-Guided Move Ordering**: Combines TT moves, MVV-LVA captures, SEE, Killer moves, Countermove heuristic, Continuation history, and policy head logits (`score += static_cast<int>(logit * 5000.0f)`).
   - **Policy-Guided LMR**: Reduces LMR depth discount for high-confidence policy moves (`logit > 1.2`), focusing tree search on natural master moves while pruning low-confidence candidate moves (`logit < -1.5`) earlier.
   - Iterative Deepening with dynamic widening Aspiration Windows (fail-low / fail-high widening)
-  - **2-Slot Clustered Transposition Table**: Depth-preferred slot with aging demotion and Always-replace/Age-preferred slot, with 32-bit key verification and 16-byte cache alignment.
+  - **4-Slot Clustered Transposition Table**: Full 64-bit key verification with depth-, age-, and bound-aware replacement.
   - **History Gravity**: Dynamic positive bonus and negative malus decay formula (`score += bonus - (score * |bonus|)/16384`) capped at $\pm 16384$.
   - **Continuation History**: 1-ply piece-to-square continuation history (`conthist[piece][from][to]`) tracking responses to the opponent's previous move.
   - **Countermove Heuristic**: 2D lookup table (`countermove[piece][to]`) prioritizing specific refutations to the previous move on quiet cutoffs.
   - **ProbCut Pruning**: At depth $\ge 5$, probes shallow capture searches against an aggressive $\beta + 180$ threshold to prune cut subtrees early.
-  - **Enhanced Quiescence Search**: Includes queen/minor piece promotions and selective quiet checks (`gives_check`) within root plies (`ply <= 2`).
+  - **Enhanced Quiescence Search**: Includes promotions and selective quiet checks only near the quiescence root to avoid checking-tree explosions.
   - **Logarithmic Late Move Reduction (LMR)**: Precomputed $64 \times 64$ logarithmic reduction table dynamically adjusted for cut-nodes and check evasions.
   - **Syzygy Endgame Tablebases**: Direct Fathom probing engine integration supporting 3-4-5-6 piece Syzygy WDL tables and instant root move probing.
   - Static Exchange Evaluation (SEE) pruning and move ordering
@@ -118,7 +118,7 @@ GiraffeGPU/
 
 ## Building and Cross-Platform Support
 
-GiraffeGPU compiles and runs natively on both **Linux** and **Windows (x86_64)**.
+GiraffeGPU has a native CUDA build for Linux and a separate native CUDA build path for Windows. A portable Windows CPU fallback is also available.
 
 ---
 
@@ -150,11 +150,10 @@ The executable will be located at `./build/GiraffeGPU`.
 
 ### 2. Windows Compilation & Precompiled Binary
 
-#### Precompiled Standalone Executable
-A ready-to-run Windows 64-bit standalone executable (`GiraffeGPU.exe`) is included in the root of the repository:
+#### Portable Windows CPU Executable
+A Windows 64-bit standalone executable (`GiraffeGPU.exe`) may be included in the repository:
 - **Path**: `GiraffeGPU.exe`
-- Completely self-contained with no external DLL dependencies required.
-- Dynamically loads `nvcuda.dll` when an NVIDIA GPU driver is detected, and features a high-performance vectorized CPU fallback.
+- Built from the portable CPU fallback path and does not contain the Linux CUDA kernels.
 - Works out-of-the-box in Windows Chess GUIs (Arena, Fritz, CuteChess, Bankchess, Lucas Chess).
 
 #### Option A: Cross-Compile for Windows on Linux (via Make & Zig)
@@ -164,7 +163,23 @@ make windows
 ```
 *(Uses Zig's built-in cross-compiler `zig c++ -target x86_64-windows-gnu` to produce `GiraffeGPU.exe`).*
 
-#### Option B: Native Windows Build with CMake and Visual Studio (MSVC)
+This is the portable CPU fallback. For a Windows NVIDIA GPU build equivalent to
+the Linux CUDA engine, use a Windows Visual Studio Developer PowerShell with
+the NVIDIA CUDA Toolkit installed:
+
+```powershell
+Set-Location C:\path\to\GiraffeGPU
+Set-ExecutionPolicy -Scope Process Bypass
+.\build_windows_cuda.ps1
+```
+
+The script produces `GiraffeGPU_cuda.exe`, compiles `src/cuda/neural_gpu.cu`,
+excludes the CPU-only `neural_win.cpp`, and requires `nvcc` and `cl.exe` on
+`PATH`. Set `GIRAFFE_CUDA_ARCH` to match the GPU if needed, for example
+`sm_89` or `sm_120`. This native Windows build cannot be produced by the Linux
+Zig cross-compiler because it requires the Windows CUDA/MSVC toolchain.
+
+#### Option B: Native Windows CPU Build with CMake and Visual Studio (MSVC)
 On a Windows machine with Visual Studio 2019/2022 installed:
 ```powershell
 mkdir build
@@ -174,7 +189,7 @@ cmake --build . --config Release
 ```
 The binary will be generated at `build\Release\GiraffeGPU.exe`.
 
-#### Option C: Native Windows Build with MinGW-w64 or Clang
+#### Option C: Native Windows CPU Build with MinGW-w64 or Clang
 From a Windows Command Prompt or MSYS2 / PowerShell:
 ```powershell
 g++ -O3 -std=c++17 -Isrc -pthread src/*.cpp -o GiraffeGPU.exe
@@ -227,6 +242,11 @@ Launch `./GiraffeGPU` (Linux) or `.\GiraffeGPU.exe` (Windows) directly:
 - `setoption name Hash value <MB>` - Sets transposition table size in MB (e.g., `256` or `1024`).
 - `setoption name BatchSize value <size>` - Sets maximum GPU evaluation batch size.
 - `setoption name PolicyNet value <true/false>` - Enables or disables Dual-Head Policy Network move ordering and LMR guidance (default: `true`).
+- `setoption name AspirationWindow value <cp>` - Sets the initial aspiration-window width (default: `32`).
+- `setoption name NullMoveReduction value <plies>` - Sets the base null-move reduction (default: `3`).
+- `setoption name LMRMovesThreshold value <moves>` - Number of ordered moves searched before LMR begins (default: `3`).
+- `setoption name LMRDepthThreshold value <depth>` - Minimum depth at which LMR is enabled (default: `3`).
+- `setoption name ProbCutMargin value <cp>` - Extra margin used by capture ProbCut (default: `180`).
 - `setoption name SyzygyPath value <path>` - Path to Syzygy 3-4-5-6 piece tablebases (WDL and DTZ files, separated by semicolons or colons).
 - `setoption name Ponder value <true/false>` - Enables or disables pondering on opponent's time (default: `true`).
 - `setoption name WeightsFile value <path>` - Loads custom Giraffe network weights (supports both `GIRAFDUAL` and legacy `GIRAFGPU` formats).
@@ -300,20 +320,33 @@ make test-selfplay
 Trains and fine-tunes both the Value Head (position evaluation) and the Policy Head (move selection logits) on cumulative self-play datasets:
 
 ```bash
-# Fine-tune dual-head network weights on self-play data:
+# Fine-tune the value output layer on self-play data:
 python3 testing/run_tests.py --train --epochs 5
 
 # Or invoke the trainer directly with custom weight paths:
-python3 testing/train_weights.py --data testing/results/selfplay_dataset.jsonl --in-weights eval.net --out-weights testing/results/candidate.net --epochs 5
+python3 testing/train_weights.py --data testing/results/selfplay_dataset.jsonl \
+  --in-weights eval.net --out-weights testing/results/candidate.net \
+  --epochs 5 --lr 0.00025 --max-output-delta 0.02 --policy-lr 0
 ```
-- **Dual Loss Optimization**: Minimizes mean-squared error for the scalar value head while optimizing cross-entropy loss over legal moves for the policy head.
-- **Binary Format Support**: Serializes networks in high-efficiency `GIRAFDUAL` format with complete backward compatibility for legacy `GIRAFGPU` files.
+- Uses FEN-aware, white-perspective targets blended from final game outcomes and normalized search evaluations.
+- Reports an 80/20 validation split to expose overfitting before match testing.
+- Updates only the value output layer by default; the policy head is frozen unless explicitly enabled.
+- Limits output-layer drift per cycle and preserves compatibility with legacy `GIRAFGPU` weight files.
 
 ### 5. SPSA Automated Search Parameter Tuner
 Uses Simultaneous Perturbation Stochastic Approximation to optimize search and pruning parameters (null move reduction, LMR thresholds, aspiration window margins, SEE margins):
 
 ```bash
-python3 testing/run_tests.py --spsa --iters 20 --tc 3+0.05
+    python3 testing/run_tests.py --spsa --iters 20 --spsa-games 8 --tc 3+0.05
+
+The SPSA tuner runs real `cutechess-cli` matches between the plus and minus
+parameter vectors and records every iteration in
+`testing/results/spsa_history.jsonl`. It automatically saves the best observed
+search vector to `testing/results/best_search_params.json`, writes its UCI
+options to `best_search_options.txt`, and trains
+`testing/results/candidate.net` from the self-play dataset. Pass
+`--no-train-weights` to skip neural training. It requires `cutechess-cli` to be
+installed and a CUDA-capable engine host for meaningful strength results.
 ```
 
 ### 6. 5-Day Autonomous Self-Improvement System (`autonomous_5day.py`)
@@ -325,7 +358,7 @@ GiraffeGPU includes a fully automated, 120-hour (5-day) self-improvement daemon 
 ```mermaid
 flowchart TD
     A["Dual-GPU Self-Play\n(Generate ~15,000 games/day with opening randomization)"] --> B["Data Extraction & Replay Buffer\n(Extract 363-dim features + TD(λ) game outcomes)"]
-    B --> C["Neural Network Retraining\n(Gradient descent on eval.net weights)"]
+    B --> C["Neural Network Retraining\n(Blended FEN-aware value targets)"]
     C --> D["Automated SPRT Gauntlet\n(Candidate vs Baseline: 100+ games at 3+0.05)"]
     D -- "PASS (Elo gain confirmed at 95% CI)" --> E["Promote Candidate to Master\n(Update eval.net & recompile binaries)"]
     D -- "FAIL (No statistical gain)" --> F["Revert & Perturb Parameters\n(SPSA Search Tuning)"]
@@ -340,9 +373,9 @@ flowchart TD
 | **Day 1** | **Search Parameter Optimization (SPSA)** | Automated tuning of search heuristics using `tune_spsa.py`: Late Move Reductions (LMR), Null-Move $R$ margins, Aspiration Window size, and Killer/History table weights. | **+40 to +70 Elo** |
 | **Day 2** | **Tactical Distillation & Opening Tuning** | Generate games against reference engines to train the 363-dim network to eliminate opening blunders and tactical oversights. | **+60 to +100 Elo** |
 | **Day 3** | **Large-Scale Dual-GPU Self-Play** | Continuous self-play using both GPUs (~25,000 games) starting from 6–10 ply randomized positions from `testing/books/openings.epd`. | **+50 to +80 Elo** |
-| **Day 4** | **TD($\lambda$) Reinforcement Learning Loop** | Train the 363-feature weights using TD($\lambda$) bootstrapping: blending tree search evaluations with game outcomes ($y = (1-\lambda)V_{\text{search}} + \lambda R_{\text{game}}$). | **+40 to +70 Elo** |
-| **Day 5** | **Grand Match Gauntlet & Packaging** | Run a 200-game match gauntlet, benchmark against `bk.epd` and `tactics.epd`, and compile updated Linux (`GiraffeGPU`) and Windows (`GiraffeGPU.exe`) binaries. | **+20 to +40 Elo** |
-| **Total** | | | **+210 to +360 Elo** |
+| **Day 4** | **FEN-Aware Value Training** | Train the value output layer using blended white-perspective search and game-result targets, with a held-out validation split. | **Measured by SPRT** |
+| **Day 5** | **Validation & Packaging** | Run the SPRT gauntlet and EPD benchmarks. Linux is rebuilt locally; the native Windows CUDA binary is built on Windows with `build_windows_cuda.ps1`. | **Measured by SPRT** |
+| **Total** | | | **No guaranteed Elo gain** |
 
 #### Commands to Run and Monitor
 
@@ -366,7 +399,7 @@ python3 testing/autonomous_5day.py --stop
 
 #### Fault-Tolerance & State Persistence
 - **Resumable**: State is continuously persisted to `testing/results/autonomous_state.json`. If the machine restarts or the process is stopped, running `--daemon` or `--start` will automatically resume exactly where it left off.
-- **Auto-Promotion**: Whenever a candidate network wins an SPRT match at 95% confidence, it is automatically deployed to `eval.net` and both Linux and Windows standalone binaries are updated.
+- **Auto-Promotion**: Whenever a candidate network wins an SPRT match at 95% confidence, it is deployed to `eval.net`. The autonomous Linux host can rebuild the portable Windows CPU fallback; the native Windows CUDA executable must be rebuilt on Windows with `build_windows_cuda.ps1`.
 
 ---
 

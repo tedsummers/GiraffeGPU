@@ -39,9 +39,9 @@ struct SearchWorker {
     // Countermove table: prev_piece -> prev_to_square -> counter_move
     Move countermove[PIECE_NB][64];
 
-    // Continuation history (1-ply prior move response):
-    // prev_piece -> prev_to_square -> curr_piece -> curr_to_square
-    int conthist[PIECE_NB][64][64];
+    // Continuation history: previous piece/to -> current piece/to.
+    // int16_t is sufficient for the gravity range and keeps worker state small.
+    int16_t conthist[PIECE_NB][64][PIECE_NB][64];
 
     // Move stack for continuation history lookups
     Move move_stack[128];
@@ -76,6 +76,13 @@ public:
     void set_threads(int num_threads);
     int num_threads() const { return num_threads_; }
 
+    void set_aspiration_window(int value) { aspiration_window_ = std::max(1, std::min(value, 1000)); }
+    void set_null_move_reduction(int value) { null_move_reduction_ = std::max(1, std::min(value, 8)); }
+    void set_lmr_moves_threshold(int value) { lmr_moves_threshold_ = std::max(1, std::min(value, 32)); }
+    void set_lmr_depth_threshold(int value) { lmr_depth_threshold_ = std::max(1, std::min(value, 16)); }
+    void set_probcut_margin(int value) { probcut_margin_ = std::max(25, std::min(value, 1000)); }
+    void set_move_overhead(int value) { move_overhead_ms_ = std::max(0, std::min(value, 1000)); }
+
     void start(Board& board, const SearchLimits& limits);
     void stop();
     void ponderhit();
@@ -99,7 +106,7 @@ private:
     void worker_search(Board board, int worker_id, int max_depth);
 
     Value pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha, Value beta, bool cut_node);
-    Value qsearch(Board& board, SearchWorker& w, int ply, Value alpha, Value beta);
+    Value qsearch(Board& board, SearchWorker& w, int ply, Value alpha, Value beta, int qply = 0);
 
     void order_moves(const Board& board, const SearchWorker& w, std::vector<Move>& moves, Move tt_move, int ply, const float* policy = nullptr);
     void update_quiet_history(SearchWorker& w, const Board& board, Move best_quiet, const std::vector<Move>& quiet_moves, int depth, int ply);
@@ -114,6 +121,12 @@ private:
     bool ponder_enabled_;
     bool policy_net_enabled_;
     int num_threads_;
+    int aspiration_window_;
+    int null_move_reduction_;
+    int lmr_moves_threshold_;
+    int lmr_depth_threshold_;
+    int probcut_margin_;
+    int move_overhead_ms_;
     SearchLimits limits_;
     std::chrono::steady_clock::time_point start_time_;
     int64_t target_time_ms_;

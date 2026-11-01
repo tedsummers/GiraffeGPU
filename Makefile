@@ -60,6 +60,12 @@ windows: $(OBJ_DIR)
 	@echo "Build successful: ./$(WIN_TARGET)"
 	@echo "============================================="
 
+# Native Windows GPU build. Run build_windows_cuda.ps1 from a Windows
+# Developer PowerShell with CUDA nvcc and MSVC available. The existing
+# `windows` target remains the portable CPU fallback cross-build.
+windows-cuda:
+	powershell -ExecutionPolicy Bypass -File .\\build_windows_cuda.ps1
+
 test-epd:
 	python3 testing/run_tests.py --suite bk --movetime 1000
 
@@ -78,4 +84,4 @@ autonomous-daemon:
 autonomous-status:
 	python3 testing/autonomous_5day.py --status
 
-.PHONY: all clean windows test-epd test-tactics test-selfplay autonomous-5day autonomous-daemon autonomous-status
+.PHONY: all clean windows windows-cuda test-epd test-tactics test-selfplay autonomous-5day autonomous-daemon autonomous-status

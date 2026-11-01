@@ -34,14 +34,11 @@ void TranspositionTable::new_search() {
 bool TranspositionTable::probe(uint64_t key, TTEntry& entry) const {
     if (num_clusters_ == 0) return false;
     size_t idx = key % num_clusters_;
-    uint32_t key32 = static_cast<uint32_t>(key >> 32);
-
     const TTCluster& cluster = table_[idx];
 
-    // Check slot 0 (depth-preferred) then slot 1 (always-replace)
-    for (int i = 0; i < 2; ++i) {
-        if (cluster.entries[i].flag != TT_NONE && cluster.entries[i].key32 == key32) {
-            entry = cluster.entries[i];
+    for (const TTEntry& candidate : cluster.entries) {
+        if (candidate.flag != TT_NONE && candidate.key == key) {
+            entry = candidate;
             return true;
         }
     }
@@ -51,15 +48,13 @@ bool TranspositionTable::probe(uint64_t key, TTEntry& entry) const {
 void TranspositionTable::store(uint64_t key, Move move, Value score, int depth, TTFlag flag, int ply) {
     if (num_clusters_ == 0) return;
     size_t idx = key % num_clusters_;
-    uint32_t key32 = static_cast<uint32_t>(key >> 32);
-
     TTCluster& cluster = table_[idx];
 
     int target_slot = -1;
 
     // 1. If key already exists in one of the slots, update that slot
-    for (int i = 0; i < 2; ++i) {
-        if (cluster.entries[i].key32 == key32 && cluster.entries[i].flag != TT_NONE) {
+    for (int i = 0; i < 4; ++i) {
+        if (cluster.entries[i].key == key && cluster.entries[i].flag != TT_NONE) {
             target_slot = i;
             break;
         }
@@ -67,7 +62,8 @@ void TranspositionTable::store(uint64_t key, Move move, Value score, int depth, 
 
     if (target_slot != -1) {
         TTEntry& e = cluster.entries[target_slot];
-        if (depth >= e.depth - 2 || e.generation != generation_) {
+        if (depth >= e.depth - 2 || e.generation != generation_ || flag == TT_EXACT) {
+            e.key = key;
             if (!move.is_null()) e.move_data = move.data;
             e.score = static_cast<int16_t>(score_to_tt(score, ply));
             e.depth = static_cast<int8_t>(depth);
@@ -79,30 +75,26 @@ void TranspositionTable::store(uint64_t key, Move move, Value score, int depth, 
         return;
     }
 
-    // 2. Otherwise pick replacement:
-    // Slot 0 is reserved for deeper entries or stale entries from past moves.
-    // Slot 1 is always replaced (or replaced if older).
-    TTEntry& s0 = cluster.entries[0];
-    TTEntry& s1 = cluster.entries[1];
-
-    if (s0.flag == TT_NONE) {
-        target_slot = 0;
-    } else if (s1.flag == TT_NONE) {
-        target_slot = 1;
-    } else if (s0.generation != generation_) {
-        target_slot = 0; // Age-out slot 0
-    } else if (depth > s0.depth) {
-        // Demote previous slot 0 to slot 1 if deeper than current slot 1
-        if (s0.depth > s1.depth || s1.generation != generation_) {
-            s1 = s0;
+    // Replace the lowest-quality entry.  Old generations are deliberately
+    // discounted, so a shallow result from the current search cannot evict a
+    // useful deep result while stale entries do not live forever.
+    int worst_quality = 1 << 30;
+    for (int i = 0; i < 4; ++i) {
+        const TTEntry& e = cluster.entries[i];
+        if (e.flag == TT_NONE) {
+            target_slot = i;
+            break;
         }
-        target_slot = 0;
-    } else {
-        target_slot = 1;
+        const int age = static_cast<uint8_t>(generation_ - e.generation);
+        const int quality = static_cast<int>(e.depth) - age * 8 + (e.flag == TT_EXACT ? 4 : 0);
+        if (quality < worst_quality) {
+            worst_quality = quality;
+            target_slot = i;
+        }
     }
 
     TTEntry& e = cluster.entries[target_slot];
-    e.key32 = key32;
+    e.key = key;
     e.move_data = move.data;
     e.score = static_cast<int16_t>(score_to_tt(score, ply));
     e.depth = static_cast<int8_t>(depth);
@@ -127,7 +119,7 @@ int TranspositionTable::hashfull() const {
     int sampled = 0;
     int filled = 0;
     for (size_t i = 0; i < 1000 && i < num_clusters_; ++i) {
-        for (int s = 0; s < 2; ++s) {
+        for (int s = 0; s < 4; ++s) {
             sampled++;
             if (table_[i].entries[s].flag != TT_NONE && table_[i].entries[s].generation == generation_) {
                 filled++;

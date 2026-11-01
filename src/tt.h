@@ -12,21 +12,22 @@ enum TTFlag : uint8_t {
     TT_UPPERBOUND = 3
 };
 
-// 16-byte packed Transposition Table entry with 32-bit key verification
+// A compact transposition-table entry.  Keep the complete key: a 32-bit
+// verification key is too collision-prone for long searches.
 struct TTEntry {
-    uint32_t key32;         // Upper 32 bits of 64-bit Zobrist key
+    uint64_t key;           // Full Zobrist key
     uint16_t move_data;     // Best move encoded
     int16_t score;          // Centipawn / mate score
     int8_t depth;           // Search depth
     uint8_t flag;           // Exact, Lowerbound, Upperbound
     uint8_t generation;     // Aging generation
     int8_t eval;            // Static evaluation cache (optional)
-    uint32_t padding;       // Alignment to 16 bytes
 };
 
-// 2-slot cluster: [0] Depth-preferred, [1] Always-replace / Age-preferred
+// Four entries per cluster gives replacement policy room without increasing
+// the number of hash-index calculations.
 struct TTCluster {
-    TTEntry entries[2];
+    TTEntry entries[4];
 };
 
 class TranspositionTable {
