@@ -9,7 +9,7 @@
   <em>(<a href="http://arxiv.org/abs/1509.01549">arXiv:1509.01549</a>, <a href="https://chessprogramming.org/Giraffe">chessprogramming.org/Giraffe</a>, and <a href="https://github.com/ianfab/Giraffe">ianfab/Giraffe</a>)</em>
 </p>
 
-> **Authorship**: Written by **Gemini 3.8 Flash** using directions from **Ted Summers**; bug-checked and debugged by **GPT 5.6 Luna**.
+> **Authorship**: Written by **Gemini 3.8 Flash** using directions from **Ted Summers**; bug-checked and debugged by **GPT 5.6 Luna** with assistance from **Ted Summers**.
 
 ---
 
@@ -418,7 +418,7 @@ cutechess-cli \
 
 ## Authors & Credits
 
-- **Engine Implementation**: Written by **Gemini 3.8 Flash** using directions from **Ted Summers**; bug-checked and debugged by **GPT 5.6 Luna**.
+- **Engine Implementation**: Written by **Gemini 3.8 Flash** using directions from **Ted Summers**; bug-checked and debugged by **GPT 5.6 Luna** with assistance from **Ted Summers**.
 - **Theoretical Architecture**: Based on the research and neural architecture designed by Matthew Lai (*Giraffe: Using Deep Reinforcement Learning to Play Chess*, Imperial College London, 2015).
 
 ---
