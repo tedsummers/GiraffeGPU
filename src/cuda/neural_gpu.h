@@ -74,7 +74,9 @@ struct DeviceContext {
                       const std::vector<float>& w_pol, const std::vector<float>& b_pol);
 
     Value evaluate_single(const Board& board);
+    Value evaluate_with_h2(const Board& board, float* out_h2);
     Value evaluate_dual(const Board& board, float* out_policy_4096);
+    void evaluate_batch_raw(const Board* boards, int count, Value* out_scores);
     void evaluate_batch_internal(const std::vector<Board>& boards, int start_idx, int count, std::vector<Value>& out_scores);
 };
 
@@ -95,14 +97,25 @@ public:
     bool save_weights(const std::string& path);
     void init_default_weights();
 
-    // Returns centipawn score from the perspective of side to move
-    Value evaluate(const Board& board, int worker_id = 0);
+    // Returns centipawn score from the perspective of side to move (executes on GPU)
+    Value evaluate(const Board& board, int worker_id = -1);
 
-    // Dual-Head: Returns centipawn score and fills out_policy_4096 (4096 move logits)
-    Value evaluate_dual(const Board& board, float* out_policy_4096, int worker_id = 0);
+    // Executes fused 3-layer value pass on GPU and optionally copies back 64-dim L2 activations for policy scoring
+    Value evaluate_with_h2(const Board& board, float* out_h2 = nullptr, int worker_id = -1);
 
-    // Queries policy logits (4096 elements)
-    void get_policy(const Board& board, std::vector<float>& out_logits, int worker_id = 0);
+    // Dual-Head: Returns centipawn score and fills out_policy_4096 (4096 move logits) on GPU
+    Value evaluate_dual(const Board& board, float* out_policy_4096, int worker_id = -1);
+
+    // Zero-allocation multi-block GPU batch evaluation
+    void evaluate_batch_raw(const Board* boards, int count, Value* out_scores, int worker_id = -1);
+
+    // Queries policy logits (4096 elements) and returns centipawn evaluation
+    Value get_policy(const Board& board, std::vector<float>& out_logits, int worker_id = 0);
+
+    // Fast lock-free CPU SIMD forward pass for single-position evaluation in tree search
+    Value evaluate_fast_cpu(const Board& board, float* out_h2 = nullptr) const;
+    Value evaluate_dual_fast_cpu(const Board& board, float* out_policy_4096) const;
+    float score_move_policy_fast_cpu(int pol_idx, const float* h2) const;
 
     // Computes normalized softmax probabilities over legal moves
     void get_move_probabilities(const Board& board, const std::vector<Move>& moves, std::vector<float>& out_probs, int worker_id = 0);

@@ -10,7 +10,10 @@
 #include <algorithm>
 #include <tuple>
 
-UCI::UCI() = default;
+#include <fstream>
+
+UCI::UCI() {
+}
 
 UCI::~UCI() {
     handle_stop();
@@ -27,7 +30,7 @@ void UCI::handle_uci() {
     std::cout << "id name GiraffeGPU 1.0" << std::endl;
     std::cout << "id author Gemini 3.8 Flash / Ted Summers" << std::endl;
     std::cout << "option name Hash type spin default 64 min 1 max 16384" << std::endl;
-    std::cout << "option name Threads type spin default 2 min 1 max 64" << std::endl;
+    std::cout << "option name Threads type spin default 4 min 1 max 64" << std::endl;
     std::cout << "option name Device_GPU type spin default -1 min -1 max 7" << std::endl;
     std::cout << "option name BatchSize type spin default 512 min 1 max 4096" << std::endl;
     std::cout << "option name Ponder type check default true" << std::endl;
@@ -38,12 +41,15 @@ void UCI::handle_uci() {
     std::cout << "option name LMRDepthThreshold type spin default 3 min 1 max 16" << std::endl;
     std::cout << "option name ProbCutMargin type spin default 180 min 25 max 1000" << std::endl;
     std::cout << "option name MoveOverhead type spin default 30 min 0 max 1000" << std::endl;
-    std::cout << "option name SyzygyPath type string default <empty>" << std::endl;
+    std::cout << "option name SyzygyPath type string default " << (syzygy_path_.empty() ? "<empty>" : syzygy_path_) << std::endl;
     std::cout << "option name WeightsFile type string default eval.net" << std::endl;
     std::cout << "uciok" << std::endl;
 }
 
 void UCI::handle_isready() {
+    if (Syzygy::max_pieces() == 0 && !syzygy_path_.empty() && syzygy_path_ != "<empty>") {
+        g_search.set_syzygy_path(syzygy_path_);
+    }
     if (!Neural::g_neural_gpu.is_initialized()) {
         Neural::g_neural_gpu.init(Neural::ALL_GPUS, 512);
     }
@@ -116,8 +122,11 @@ void UCI::handle_setoption(const std::string& line) {
     } else if (opt_name == "MoveOverhead") {
         try { g_search.set_move_overhead(std::stoi(val_str)); } catch (...) {}
     } else if (opt_name == "SyzygyPath") {
-        g_search.set_syzygy_path(val_str);
-        std::cout << "info string SyzygyPath set to " << val_str << " (TB_LARGEST=" << Syzygy::max_pieces() << ")" << std::endl;
+        if (!val_str.empty() && val_str != "<empty>") {
+            syzygy_path_ = val_str;
+            g_search.set_syzygy_path(syzygy_path_);
+            std::cout << "info string SyzygyPath set to " << syzygy_path_ << " (TB_LARGEST=" << Syzygy::max_pieces() << ")" << std::endl;
+        }
     } else if (opt_name == "WeightsFile") {
         weights_path_ = val_str;
         if (Neural::g_neural_gpu.is_initialized() && Neural::g_neural_gpu.load_weights(weights_path_)) {
@@ -137,6 +146,7 @@ void UCI::handle_setoption(const std::string& line) {
 void UCI::handle_ucinewgame() {
     handle_stop();
     g_tt.clear();
+    g_search.clear_histories();
     board_.set_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
 }
 
@@ -170,9 +180,11 @@ void UCI::handle_position(const std::string& line) {
 }
 
 void UCI::handle_go(const std::string& line) {
+    auto go_arrival_time = std::chrono::steady_clock::now();
     handle_stop();
 
     SearchLimits limits;
+    limits.start_time = go_arrival_time;
     std::istringstream iss(line);
     std::string token;
     iss >> token; // "go"
@@ -204,6 +216,9 @@ void UCI::handle_go(const std::string& line) {
     if (!Neural::g_neural_gpu.is_initialized()) {
         Neural::g_neural_gpu.init(Neural::ALL_GPUS, 512);
     }
+    if (!weights_loaded_ && Neural::g_neural_gpu.is_initialized()) {
+        weights_loaded_ = Neural::g_neural_gpu.load_weights(weights_path_);
+    }
 
     // Spawn search thread
     search_thread_ = std::thread([this, limits]() {
@@ -218,15 +233,18 @@ void UCI::handle_ponderhit() {
 uint64_t UCI::perft(Board& b, int depth) {
     if (depth == 0) return 1ULL;
 
-    std::vector<Move> moves;
-    b.generate_legal_moves(moves);
-    if (depth == 1) return moves.size();
+    MoveList moves;
+    if (depth == 1) {
+        b.generate_legal_moves(moves);
+        return moves.size();
+    }
 
+    b.generate_pseudo_legal_moves(moves);
     uint64_t total = 0;
-    for (const auto& m : moves) {
-        if (b.make_move(m)) {
+    for (size_t i = 0; i < moves.size(); ++i) {
+        if (b.make_move(moves[i])) {
             total += perft(b, depth - 1);
-            b.unmake_move(m);
+            b.unmake_move(moves[i]);
         }
     }
     return total;
@@ -234,12 +252,13 @@ uint64_t UCI::perft(Board& b, int depth) {
 
 void UCI::handle_perft(int depth) {
     auto t0 = std::chrono::steady_clock::now();
-    std::vector<Move> moves;
+    MoveList moves;
     board_.generate_legal_moves(moves);
 
     uint64_t total = 0;
     std::cout << "\nPerft Depth " << depth << ":\n";
-    for (const auto& m : moves) {
+    for (size_t i = 0; i < moves.size(); ++i) {
+        Move m = moves[i];
         if (board_.make_move(m)) {
             uint64_t sub = (depth > 1) ? perft(board_, depth - 1) : 1ULL;
             board_.unmake_move(m);
@@ -371,6 +390,9 @@ void UCI::handle_gpu_info() {
 void UCI::handle_bench(int depth) {
     if (!Neural::g_neural_gpu.is_initialized()) {
         Neural::g_neural_gpu.init(Neural::ALL_GPUS, 512);
+    }
+    if (!weights_loaded_ && Neural::g_neural_gpu.is_initialized()) {
+        weights_loaded_ = Neural::g_neural_gpu.load_weights(weights_path_);
     }
 
     const std::vector<std::string> bench_positions = {

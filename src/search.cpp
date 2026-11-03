@@ -25,9 +25,11 @@ Search::Search()
     , searching_(false)
     , pondering_(false)
     , nodes_(0)
+    , tb_hits_(0)
+    , start_time_ns_(0)
     , ponder_enabled_(true)
     , policy_net_enabled_(true)
-    , num_threads_(2)
+    , num_threads_(4)
     , aspiration_window_(32)
     , null_move_reduction_(3)
     , lmr_moves_threshold_(3)
@@ -52,6 +54,19 @@ Search::~Search() {
 
 void Search::set_threads(int num_threads) {
     num_threads_ = std::max(1, std::min(num_threads, 64));
+    while (static_cast<int>(workers_.size()) < num_threads_ - 1) {
+        auto w = std::make_unique<SearchWorker>();
+        w->id = static_cast<int>(workers_.size()) + 1;
+        w->clear();
+        workers_.push_back(std::move(w));
+    }
+}
+
+void Search::clear_histories() {
+    main_worker_.clear();
+    for (auto& w : workers_) {
+        if (w) w->clear();
+    }
 }
 
 void Search::stop() {
@@ -60,11 +75,20 @@ void Search::stop() {
 }
 
 void Search::ponderhit() {
-    pondering_.store(false);
-    start_time_ = std::chrono::steady_clock::now();
+    auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    start_time_ns_.store(now_ns, std::memory_order_relaxed);
+    pondering_.store(false, std::memory_order_relaxed);
 }
 
-bool Search::check_time() {
+int64_t Search::elapsed_ms() const {
+    auto now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    int64_t start_ns = start_time_ns_.load(std::memory_order_relaxed);
+    return std::max<int64_t>(0, (now_ns - start_ns) / 1000000);
+}
+
+bool Search::check_time(bool force_clock_check) {
     if (stop_flag_.load(std::memory_order_relaxed)) return true;
     if (limits_.nodes > 0 && nodes_.load(std::memory_order_relaxed) >= static_cast<uint64_t>(limits_.nodes)) {
         stop_flag_.store(true, std::memory_order_relaxed);
@@ -72,12 +96,8 @@ bool Search::check_time() {
     }
     if (pondering_.load(std::memory_order_relaxed)) return false;
 
-    // GPU evaluation and OS scheduling can make a 1024-node polling interval
-    // overshoot a short clock. Poll frequently enough for fast time controls.
-    if ((nodes_.load(std::memory_order_relaxed) & 63) == 0 && hard_limit_ms_ > 0) {
-        auto now = std::chrono::steady_clock::now();
-        int64_t elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time_).count();
-        if (elapsed >= hard_limit_ms_) {
+    if (hard_limit_ms_ > 0 && (force_clock_check || (nodes_.load(std::memory_order_relaxed) & 7) == 0)) {
+        if (elapsed_ms() >= hard_limit_ms_) {
             stop_flag_.store(true, std::memory_order_relaxed);
             return true;
         }
@@ -100,7 +120,7 @@ static inline void update_history_score(int16_t& score, int bonus) {
 }
 
 void Search::update_quiet_history(SearchWorker& w, const Board& board, Move best_quiet,
-                                  const std::vector<Move>& quiet_moves, int depth, int ply)
+                                  const MoveList& quiet_moves, int depth, int ply)
 {
     int bonus = std::min(depth * depth * 32, 2000);
 
@@ -122,7 +142,8 @@ void Search::update_quiet_history(SearchWorker& w, const Board& board, Move best
 
     // Penalize other tried quiet moves with negative gravity
     int malus = -bonus / 2;
-    for (const auto& m : quiet_moves) {
+    for (size_t i = 0; i < quiet_moves.size(); ++i) {
+        Move m = quiet_moves[i];
         if (m == best_quiet) continue;
         Piece p = board.piece_at(m.from_sq());
         update_history_score(w.history[p][m.to_sq()], malus);
@@ -139,22 +160,26 @@ void Search::update_quiet_history(SearchWorker& w, const Board& board, Move best
     }
 }
 
-void Search::order_moves(const Board& board, const SearchWorker& w, std::vector<Move>& moves, Move tt_move, int ply, const float* policy) {
-    std::vector<std::pair<int, Move>> scored_moves;
-    scored_moves.reserve(moves.size());
+void Search::order_moves(const Board& board, const SearchWorker& w, MoveList& moves, Move tt_move, int ply, const float* policy_h2) {
+    int scores[256];
+    const size_t n = moves.size();
 
     Move prev_m = (ply > 0) ? w.move_stack[ply - 1] : MOVE_NONE;
     Piece prev_p = (!prev_m.is_null()) ? board.piece_at(prev_m.to_sq()) : NO_PIECE;
     Move cm = (prev_p != NO_PIECE) ? w.countermove[prev_p][prev_m.to_sq()] : MOVE_NONE;
 
-    for (const auto& m : moves) {
+    for (size_t i = 0; i < n; ++i) {
+        const Move m = moves[i];
         int score = 0;
-        int pol_idx = (static_cast<int>(m.from_sq()) << 6) | static_cast<int>(m.to_sq());
-        float pol_logit = (policy != nullptr) ? policy[pol_idx] : 0.0f;
-        if (policy != nullptr && m.is_promotion() && m.promotion_type() == QUEEN) {
-            pol_logit += 0.5f;
+        int pol_pts = 0;
+        if (policy_h2 != nullptr && m != tt_move) {
+            int pol_idx = (static_cast<int>(m.from_sq()) << 6) | static_cast<int>(m.to_sq());
+            float pol_logit = Neural::g_neural_gpu.score_move_policy_fast_cpu(pol_idx, policy_h2);
+            if (m.is_promotion() && m.promotion_type() == QUEEN) {
+                pol_logit += 0.5f;
+            }
+            pol_pts = static_cast<int>(pol_logit * 5000.0f);
         }
-        int pol_pts = (policy != nullptr) ? static_cast<int>(pol_logit * 5000.0f) : 0;
 
         if (m == tt_move) {
             score = 300000;
@@ -186,92 +211,126 @@ void Search::order_moves(const Board& board, const SearchWorker& w, std::vector<
             } else {
                 Piece p = board.piece_at(m.from_sq());
                 int h_score = w.history[p][m.to_sq()];
-                Piece curr_p = board.piece_at(m.from_sq());
-                int ch_score = (prev_p != NO_PIECE && curr_p != NO_PIECE)
-                    ? w.conthist[prev_p][prev_m.to_sq()][curr_p][m.to_sq()] : 0;
+                int ch_score = (prev_p != NO_PIECE && p != NO_PIECE)
+                    ? w.conthist[prev_p][prev_m.to_sq()][p][m.to_sq()] : 0;
                 score = h_score + ch_score * 2 + pol_pts;
             }
         }
-        scored_moves.emplace_back(score, m);
+        scores[i] = score;
     }
 
-    std::sort(scored_moves.begin(), scored_moves.end(), [](const auto& a, const auto& b) {
-        return a.first > b.first;
-    });
-
-    for (size_t i = 0; i < moves.size(); ++i) {
-        moves[i] = scored_moves[i].second;
+    // In-place insertion sort on stack arrays (zero heap allocations, fast for N <= 64)
+    for (size_t i = 1; i < n; ++i) {
+        int key_score = scores[i];
+        Move key_move = moves[i];
+        size_t j = i;
+        while (j > 0 && scores[j - 1] < key_score) {
+            scores[j] = scores[j - 1];
+            moves[j] = moves[j - 1];
+            --j;
+        }
+        scores[j] = key_score;
+        moves[j] = key_move;
     }
 }
 
 Value Search::qsearch(Board& board, SearchWorker& w, int ply, Value alpha, Value beta, int qply) {
-    if (check_time()) return VALUE_ZERO;
+    if (check_time((++w.local_nodes & 7) == 0)) return VALUE_ZERO;
 
     nodes_++;
     if (ply > w.seldepth) w.seldepth = ply;
     if (ply >= 127) return Neural::g_neural_gpu.evaluate(board, w.id);
 
-    if (board.is_draw()) return VALUE_DRAW;
+    if (board.is_draw(ply)) return VALUE_DRAW;
+
+    Value tb_score;
+    if (ply > 0 && (hard_limit_ms_ < 0 || hard_limit_ms_ >= 35) && Syzygy::probe_wdl(board, tb_score, ply)) {
+        tb_hits_.fetch_add(1, std::memory_order_relaxed);
+        if (root_piece_count_ > Syzygy::max_pieces() || tb_score == VALUE_DRAW) {
+            return tb_score;
+        }
+    }
+
+    TTEntry tt_entry;
+    Move tt_move = MOVE_NONE;
+    bool tt_hit = g_tt.probe(board.key(), tt_entry);
+    if (tt_hit) {
+        tt_move = Move(tt_entry.move_data);
+        Value tt_score = g_tt.score_from_tt(tt_entry.score, ply);
+        if (tt_entry.flag == TT_EXACT) return tt_score;
+        if (tt_entry.flag == TT_LOWERBOUND && tt_score >= beta) return beta;
+        if (tt_entry.flag == TT_UPPERBOUND && tt_score <= alpha) return alpha;
+    }
 
     bool in_check = board.in_check();
     Value stand_pat = -VALUE_INFINITE;
 
     if (!in_check) {
-        stand_pat = Neural::g_neural_gpu.evaluate(board, w.id);
+        if (tt_hit && tt_entry.eval != static_cast<int16_t>(VALUE_NONE)) {
+            stand_pat = tt_entry.eval;
+        } else if (qply == 0 && w.eval_stack[ply] != VALUE_NONE) {
+            stand_pat = w.eval_stack[ply];
+        } else {
+            stand_pat = Neural::g_neural_gpu.evaluate(board, w.id);
+        }
         if (stand_pat >= beta) return beta;
         if (stand_pat > alpha) alpha = stand_pat;
     }
 
-    std::vector<Move> moves;
+    MoveList moves;
     if (in_check) {
-        board.generate_legal_moves(moves);
-        if (moves.empty()) return -VALUE_MATE + ply;
-    } else {
-        // Generate captures and promotions
-        board.generate_captures(moves);
-
-        // Quiet checks are useful near the qsearch root, but allowing them at
-        // every qsearch ply causes a large checking-tree explosion. Captures
-        // and promotions remain available at every qsearch ply.
-        std::vector<Move> all_moves;
-        board.generate_legal_moves(all_moves);
-        if (qply < 2) {
-            for (const auto& m : all_moves) {
-                if (board.piece_at(m.to_sq()) == NO_PIECE && !m.is_promotion() && board.gives_check(m))
-                    moves.push_back(m);
+        board.generate_pseudo_legal_moves(moves);
+    } else if (qply < 1) {
+        MoveList all_moves;
+        board.generate_pseudo_legal_moves(all_moves);
+        for (size_t i = 0; i < all_moves.size(); ++i) {
+            const Move m = all_moves[i];
+            if (board.piece_at(m.to_sq()) != NO_PIECE || m.is_en_passant() || m.is_promotion() || board.gives_check(m)) {
+                moves.push_back(m);
             }
         }
+    } else {
+        board.generate_pseudo_captures(moves);
     }
 
-    order_moves(board, w, moves, MOVE_NONE, ply);
+    order_moves(board, w, moves, tt_move, ply);
 
-    for (const auto& m : moves) {
+    int legal_moves = 0;
+    for (size_t i = 0; i < moves.size(); ++i) {
+        const Move m = moves[i];
         if (!in_check && !m.is_promotion() && SEE::evaluate(board, m) < 0) {
             continue;
         }
 
         w.move_stack[ply] = m;
         if (!board.make_move(m)) continue;
+        legal_moves++;
 
         Value score = -qsearch(board, w, ply + 1, -beta, -alpha, qply + 1);
         board.unmake_move(m);
 
-        if (stop_flag_.load()) return VALUE_ZERO;
+        if (stop_flag_.load(std::memory_order_relaxed)) return VALUE_ZERO;
 
         if (score >= beta) return beta;
         if (score > alpha) alpha = score;
+    }
+
+    if (in_check && legal_moves == 0) {
+        return -VALUE_MATE + ply;
     }
 
     return alpha;
 }
 
 Value Search::pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha, Value beta, bool cut_node) {
-    if (check_time()) return VALUE_ZERO;
+    if (check_time(true)) return VALUE_ZERO;
 
     w.pv_length[ply] = ply;
 
     if (ply >= 127) return Neural::g_neural_gpu.evaluate(board, w.id);
-    if (ply > 0 && board.is_draw()) return VALUE_DRAW;
+    if (ply > 0 && board.is_draw(ply)) return VALUE_DRAW;
+
+    const bool pv_node = (beta - alpha > 1);
 
     alpha = std::max(alpha, static_cast<Value>(-VALUE_MATE + ply));
     beta  = std::min(beta, static_cast<Value>(VALUE_MATE - ply - 1));
@@ -286,21 +345,28 @@ Value Search::pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha
     }
 
     nodes_++;
+    ++w.local_nodes;
 
     // 1. Syzygy Tablebase Probe
     Value tb_score;
-    if (ply > 0 && Syzygy::probe_wdl(board, tb_score, ply)) {
-        if (tb_score >= beta) return beta;
-        if (tb_score <= alpha) return alpha;
-        return tb_score;
+    if (ply > 0 && (hard_limit_ms_ < 0 || hard_limit_ms_ >= 35) && Syzygy::probe_wdl(board, tb_score, ply)) {
+        tb_hits_.fetch_add(1, std::memory_order_relaxed);
+        if (root_piece_count_ > Syzygy::max_pieces() || tb_score == VALUE_DRAW) {
+            TTFlag tb_flag = (tb_score >= beta) ? TT_LOWERBOUND : (tb_score <= alpha) ? TT_UPPERBOUND : TT_EXACT;
+            g_tt.store(board.key(), MOVE_NONE, tb_score, depth, tb_flag, ply, VALUE_NONE);
+            if (tb_score >= beta) return beta;
+            if (tb_score <= alpha) return alpha;
+            return tb_score;
+        }
     }
 
     // 2. Transposition Table Probe
     TTEntry tt_entry;
     Move tt_move = MOVE_NONE;
-    if (g_tt.probe(board.key(), tt_entry)) {
+    bool tt_hit = g_tt.probe(board.key(), tt_entry);
+    if (tt_hit) {
         tt_move = Move(tt_entry.move_data);
-        if (tt_entry.depth >= depth && ply > 0) {
+        if (tt_entry.depth >= depth && ply > 0 && !pv_node) {
             Value tt_score = g_tt.score_from_tt(tt_entry.score, ply);
             if (tt_entry.flag == TT_EXACT) return tt_score;
             if (tt_entry.flag == TT_LOWERBOUND && tt_score >= beta) return beta;
@@ -308,83 +374,175 @@ Value Search::pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha
         }
     }
 
-    // 3. Null Move Pruning
-    if (!in_check && depth >= 3 && ply > 0 &&
-        (board.piece_count(W_QUEEN) + board.piece_count(B_QUEEN) +
-         board.piece_count(W_ROOK)  + board.piece_count(B_ROOK) > 0))
-    {
-        board.make_null_move();
-        int R = null_move_reduction_ + depth / 4;
-        Value null_score = -pvs(board, w, depth - 1 - R, ply + 1, -beta, -beta + 1, !cut_node);
-        board.unmake_null_move();
+    // Compute or retrieve static evaluation and optional L2 hidden state on GPU
+    Value static_eval = VALUE_NONE;
+    alignas(32) float policy_h2[Neural::L2_DIM];
+    const float* h2_ptr = nullptr;
+    const bool use_policy = policy_net_enabled_ && (depth >= 4 || ply == 0);
 
-        if (null_score >= beta && std::abs(null_score) < VALUE_MATE_THRESHOLD) {
-            return beta;
+    if (!in_check) {
+        if (use_policy) {
+            static_eval = Neural::g_neural_gpu.evaluate_with_h2(board, policy_h2, w.id);
+            h2_ptr = policy_h2;
+        } else if (tt_hit && tt_entry.eval != static_cast<int16_t>(VALUE_NONE)) {
+            static_eval = tt_entry.eval;
+        } else if (ply > 0 && w.eval_stack[ply] != VALUE_NONE) {
+            static_eval = w.eval_stack[ply];
+        } else {
+            static_eval = Neural::g_neural_gpu.evaluate(board, w.id);
+        }
+        w.eval_stack[ply] = static_eval;
+    } else {
+        w.eval_stack[ply] = VALUE_NONE;
+    }
+
+    const bool improving = !in_check && ply >= 2 &&
+                           w.eval_stack[ply - 2] != VALUE_NONE &&
+                           static_eval > w.eval_stack[ply - 2];
+
+    if (!pv_node && !in_check && ply > 0 && std::abs(beta) < VALUE_MATE_THRESHOLD) {
+        // 3a. Reverse Futility Pruning (Static Null Move Pruning)
+        if (depth <= 6) {
+            int rfp_margin = (depth - (improving ? 1 : 0)) * 75;
+            if (static_eval - rfp_margin >= beta) {
+                return static_eval;
+            }
+        }
+
+        // 3b. Razoring
+        if (depth <= 2 && static_eval + 250 * depth <= alpha) {
+            Value r_score = qsearch(board, w, ply, alpha, alpha + 1, 0);
+            if (r_score <= alpha) return r_score;
+        }
+
+        // 3c. Null Move Pruning (checking side-to-move's non-pawn material + clearing move_stack)
+        if (depth >= 3 && static_eval >= beta && board.has_non_pawn_material(board.side_to_move())) {
+            w.move_stack[ply] = MOVE_NONE;
+            board.make_null_move();
+            int R = null_move_reduction_ + depth / 4 + std::min(3, static_cast<int>(static_eval - beta) / 180);
+            Value null_score = -pvs(board, w, depth - 1 - R, ply + 1, -beta, -beta + 1, !cut_node);
+            board.unmake_null_move();
+
+            if (null_score >= beta && std::abs(null_score) < VALUE_MATE_THRESHOLD) {
+                if (depth >= 10) {
+                    Value verif = pvs(board, w, depth - R, ply, beta - 1, beta, false);
+                    if (verif >= beta) return beta;
+                } else {
+                    return beta;
+                }
+            }
+        }
+
+        // 4. ProbCut (Pruning non-tactical branches if shallow capture search easily beats beta + threshold)
+        if (depth >= 5) {
+            Value probcut_beta = beta + probcut_margin_;
+            int probcut_depth = depth - 4;
+
+            MoveList captures;
+            board.generate_pseudo_captures(captures);
+            order_moves(board, w, captures, tt_move, ply);
+
+            for (size_t i = 0; i < captures.size(); ++i) {
+                const Move cm = captures[i];
+                if (SEE::evaluate(board, cm) < 0) continue;
+                w.move_stack[ply] = cm;
+                if (!board.make_move(cm)) continue;
+
+                Value score = -qsearch(board, w, ply + 1, -probcut_beta, -probcut_beta + 1, 0);
+                if (score >= probcut_beta) {
+                    score = -pvs(board, w, probcut_depth, ply + 1, -probcut_beta, -probcut_beta + 1, !cut_node);
+                }
+                board.unmake_move(cm);
+
+                if (score >= probcut_beta) {
+                    return beta;
+                }
+            }
         }
     }
 
-    // 4. ProbCut (Pruning non-tactical branches if shallow capture search easily beats beta + threshold)
-    if (!in_check && depth >= 5 && std::abs(beta) < VALUE_MATE_THRESHOLD) {
-        Value probcut_beta = beta + probcut_margin_;
-        int probcut_depth = depth - 4;
-
-        std::vector<Move> captures;
-        board.generate_captures(captures);
-        order_moves(board, w, captures, tt_move, ply);
-
-        for (const auto& cm : captures) {
-            if (SEE::evaluate(board, cm) < 0) continue;
-            w.move_stack[ply] = cm;
-            if (!board.make_move(cm)) continue;
-
-            Value score = -qsearch(board, w, ply + 1, -probcut_beta, -probcut_beta + 1, 0);
-            if (score >= probcut_beta) {
-                score = -pvs(board, w, probcut_depth, ply + 1, -probcut_beta, -probcut_beta + 1, !cut_node);
-            }
-            board.unmake_move(cm);
-
-            if (score >= probcut_beta) {
-                return beta;
-            }
-        }
+    // Internal Iterative Reduction (IIR)
+    if (depth >= 4 && tt_move.is_null() && (pv_node || cut_node)) {
+        depth--;
     }
 
-    // Generate legal moves
-    std::vector<Move> moves;
-    board.generate_legal_moves(moves);
-
-    if (moves.empty()) {
-        if (in_check) return -VALUE_MATE + ply;
-        return VALUE_DRAW;
+    // Generate pseudo-legal moves (or use Syzygy-filtered root moves at ply 0)
+    MoveList moves;
+    if (ply == 0 && !root_tb_moves_.empty()) {
+        moves = root_tb_moves_;
+    } else {
+        board.generate_pseudo_legal_moves(moves);
     }
-
-    std::vector<float> policy_logits;
-    const float* pol_ptr = nullptr;
-    if (policy_net_enabled_ && (depth >= 3 || ply == 0)) {
-        Neural::g_neural_gpu.get_policy(board, policy_logits, w.id);
-        pol_ptr = policy_logits.data();
-    }
-
-    order_moves(board, w, moves, tt_move, ply, pol_ptr);
+    order_moves(board, w, moves, tt_move, ply, h2_ptr);
 
     Move best_move = MOVE_NONE;
     TTFlag flag = TT_UPPERBOUND;
     Value best_score = -VALUE_INFINITE;
     int moves_searched = 0;
-    std::vector<Move> quiet_moves_tried;
+    MoveList quiet_moves_tried;
     bool history_updated_on_cutoff = false;
 
-    for (const auto& m : moves) {
+    Value child_gpu_evals[256];
+    for (size_t k = 0; k < moves.size(); ++k) child_gpu_evals[k] = VALUE_NONE;
+    bool children_batched = false;
+
+    for (size_t i = 0; i < moves.size(); ++i) {
+        // After searching the first move (e.g. TT move), if no beta cutoff occurred,
+        // batch-evaluate all remaining legal child positions in a single multi-block GPU launch!
+        if (moves_searched == 1 && !children_batched && (depth >= 2 || pv_node) && i + 1 < moves.size()) {
+            if (check_time(true)) return VALUE_ZERO;
+            children_batched = true;
+            Board batch_boards[64];
+            size_t batch_move_idx[64];
+            Value batch_scores[64];
+            int batch_count = 0;
+
+            for (size_t k = i; k < moves.size() && batch_count < 64; ++k) {
+                Move cm = moves[k];
+                if (!board.make_move(cm)) continue;
+                if (!board.in_check()) {
+                    batch_boards[batch_count] = board;
+                    batch_move_idx[batch_count] = k;
+                    batch_count++;
+                }
+                board.unmake_move(cm);
+            }
+
+            if (batch_count > 1) {
+                Neural::g_neural_gpu.evaluate_batch_raw(batch_boards, batch_count, batch_scores, w.id);
+                for (int b = 0; b < batch_count; ++b) {
+                    child_gpu_evals[batch_move_idx[b]] = batch_scores[b];
+                }
+            }
+        }
+
+        const Move m = moves[i];
         bool is_capture = (board.piece_at(m.to_sq()) != NO_PIECE) || m.is_en_passant();
         bool is_quiet = !is_capture && !m.is_promotion();
-        // gives_check() evaluates a move in the parent position. Compute it
-        // before make_move; doing this in the child position misclassifies
-        // checking moves and applies the wrong LMR reduction.
-        bool gives_check = is_quiet && board.gives_check(m);
+        bool gives_check = board.gives_check(m);
+
+        // Futility Pruning & Late Move Pruning (LMP) for quiet moves at shallow depths
+        if (ply > 0 && !pv_node && !in_check && is_quiet && !gives_check &&
+            moves_searched > 0 && best_score > -VALUE_MATE_THRESHOLD)
+        {
+            if (depth <= 4 && moves_searched >= (3 + depth * depth) / (2 - (improving ? 1 : 0))) {
+                continue;
+            }
+            if (depth <= 3 && static_eval + 110 * depth + 80 <= alpha) {
+                continue;
+            }
+            if (depth <= 4 && SEE::evaluate(board, m) < -60 * depth) {
+                continue;
+            }
+        }
 
         w.move_stack[ply] = m;
         if (!board.make_move(m)) continue;
         moves_searched++;
+
+        if (ply + 1 < 128) {
+            w.eval_stack[ply + 1] = child_gpu_evals[i];
+        }
 
         if (is_quiet) quiet_moves_tried.push_back(m);
 
@@ -394,19 +552,26 @@ Value Search::pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha
         } else {
             // Systematic Late Move Reductions (LMR)
             int reduction = 0;
-            if (depth >= lmr_depth_threshold_ && moves_searched > lmr_moves_threshold_ && is_quiet && !in_check) {
+            if (depth >= lmr_depth_threshold_ && moves_searched > lmr_moves_threshold_ && (is_quiet || !pv_node) && !in_check) {
                 int d_idx = std::min(depth, 63);
                 int m_idx = std::min(moves_searched, 63);
                 reduction = LMR_TABLE[d_idx][m_idx];
 
-                // Reduce less if cut node or in check
+                if (!pv_node) reduction += 1;
                 if (cut_node) reduction += 1;
+                if (!improving) reduction += 1;
                 if (gives_check) reduction -= 1;
 
+                if (is_quiet) {
+                    Piece p = board.piece_at(m.to_sq()); // piece is on to_sq after make_move
+                    int h_score = w.history[p][m.to_sq()];
+                    reduction -= h_score / 8192;
+                }
+
                 // Policy-guided reduction discount or penalty
-                if (pol_ptr) {
+                if (h2_ptr) {
                     int pol_idx = (static_cast<int>(m.from_sq()) << 6) | static_cast<int>(m.to_sq());
-                    float pol = pol_ptr[pol_idx];
+                    float pol = Neural::g_neural_gpu.score_move_policy_fast_cpu(pol_idx, h2_ptr);
                     if (pol > 1.2f) reduction -= 1;
                     else if (pol < -1.5f) reduction += 1;
                 }
@@ -418,7 +583,7 @@ Value Search::pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha
 
             // Re-search at full depth if reduced search exceeded alpha
             if (score > alpha && reduction > 0) {
-                score = -pvs(board, w, depth - 1, ply + 1, -alpha - 1, -alpha, true);
+                score = -pvs(board, w, depth - 1, ply + 1, -alpha - 1, -alpha, !cut_node);
             }
             // PVS full window re-search
             if (score > alpha && score < beta) {
@@ -428,7 +593,7 @@ Value Search::pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha
 
         board.unmake_move(m);
 
-        if (stop_flag_.load()) return VALUE_ZERO;
+        if (stop_flag_.load(std::memory_order_relaxed)) return VALUE_ZERO;
 
         if (score > best_score) {
             best_score = score;
@@ -449,7 +614,7 @@ Value Search::pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha
                     flag = TT_LOWERBOUND;
 
                     if (is_quiet) {
-                        if (ply < 128) {
+                        if (ply < 128 && w.killer_moves[ply][0] != m) {
                             w.killer_moves[ply][1] = w.killer_moves[ply][0];
                             w.killer_moves[ply][0] = m;
                         }
@@ -462,26 +627,31 @@ Value Search::pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha
         }
     }
 
+    if (moves_searched == 0) {
+        if (in_check) return -VALUE_MATE + ply;
+        return VALUE_DRAW;
+    }
+
     // Also learn from principal-variation nodes. Restricting updates to
     // cutoffs leaves history tables cold in quiet positions.
     if (!history_updated_on_cutoff && !best_move.is_null() && !best_move.is_promotion() &&
-        board.piece_at(best_move.to_sq()) == NO_PIECE) {
+        board.piece_at(best_move.to_sq()) == NO_PIECE && !best_move.is_en_passant()) {
         update_quiet_history(w, board, best_move, quiet_moves_tried, depth, ply);
     }
 
-    if (!stop_flag_.load()) {
-        g_tt.store(board.key(), best_move, best_score, depth, flag, ply);
+    if (!stop_flag_.load(std::memory_order_relaxed)) {
+        g_tt.store(board.key(), best_move, best_score, depth, flag, ply, static_eval);
     }
 
     return best_score;
 }
 
 void Search::worker_search(Board board, int worker_id, int max_depth) {
-    SearchWorker w;
+    SearchWorker& w = *workers_[worker_id - 1];
     w.id = worker_id;
-    w.clear();
+    w.clear_search();
 
-    for (int depth = 1 + (worker_id % 2); depth <= max_depth && !stop_flag_.load(); ++depth) {
+    for (int depth = 1 + (worker_id % 2); depth <= max_depth && !stop_flag_.load(std::memory_order_relaxed); ++depth) {
         pvs(board, w, depth, 0, -VALUE_INFINITE, VALUE_INFINITE, false);
     }
 }
@@ -492,7 +662,10 @@ void Search::start(Board& board, const SearchLimits& limits) {
     searching_.store(true);
     pondering_.store(limits_.ponder);
     nodes_.store(0);
-    start_time_ = std::chrono::steady_clock::now();
+    tb_hits_.store(0);
+    auto start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+        limits_.start_time.time_since_epoch()).count();
+    start_time_ns_.store(start_ns, std::memory_order_relaxed);
 
     target_time_ms_ = -1;
     hard_limit_ms_ = -1;
@@ -501,49 +674,55 @@ void Search::start(Board& board, const SearchLimits& limits) {
         target_time_ms_ = -1;
         hard_limit_ms_ = -1;
     } else if (limits_.movetime > 0) {
-        // Reserve time for GPU synchronization, output, and scheduler
-        // latency. A fixed 15 ms margin is unsafe for short movetimes.
         int64_t safety = std::max(int64_t(move_overhead_ms_),
-                                  std::max(int64_t(20), std::min(int64_t(250), limits_.movetime / 10)));
-        hard_limit_ms_ = std::max(int64_t(5), limits_.movetime - safety);
-        target_time_ms_ = std::max(int64_t(3), limits_.movetime - 2 * safety);
+                                  std::max(int64_t(25), std::min(int64_t(250), limits_.movetime / 10)));
+        hard_limit_ms_ = std::max(int64_t(2), limits_.movetime - safety);
+        target_time_ms_ = std::max(int64_t(1), hard_limit_ms_ * 3 / 4);
     } else {
         int64_t my_time = (board.side_to_move() == WHITE) ? limits_.wtime : limits_.btime;
         int64_t my_inc  = (board.side_to_move() == WHITE) ? limits_.winc  : limits_.binc;
 
         if (my_time > 0) {
-            int moves_left = (limits_.movestogo > 0) ? std::min(limits_.movestogo, 50) : 30;
+            int moves_left = (limits_.movestogo > 0) ? std::min(limits_.movestogo, 50) : 35;
             int64_t safety = std::max(int64_t(move_overhead_ms_),
-                                      std::max(int64_t(100), std::min(int64_t(1000), my_time / 20)));
-            int64_t available = std::max(int64_t(1), my_time - safety);
-            int64_t allocation = (my_time / moves_left) + (my_inc * 3 / 4);
-            target_time_ms_ = std::max(int64_t(1),
-                                       std::min(available, std::max(int64_t(3), allocation)));
-            // Hard limit is capped below the remaining clock so a delayed GPU
-            // completion cannot consume the entire clock.
-            hard_limit_ms_ = std::max(target_time_ms_, std::min(available, target_time_ms_ * 2));
+                                      std::max(int64_t(40), std::min(int64_t(500), my_time / 15)));
+            if (my_time <= safety + 5) {
+                target_time_ms_ = 1;
+                hard_limit_ms_ = std::max(int64_t(2), my_time / 4);
+            } else {
+                int64_t available = my_time - safety;
+                int64_t allocation = (available / moves_left) + (my_inc * 3 / 4);
+                target_time_ms_ = std::max(int64_t(1), std::min(available / 3, allocation));
+                hard_limit_ms_ = std::max(target_time_ms_, std::min(available * 3 / 4, target_time_ms_ * 2 + 10));
+            }
         }
     }
 
     g_tt.new_search();
     main_worker_.id = 0;
-    main_worker_.clear();
+    main_worker_.clear_search();
+    set_threads(num_threads_);
 
-    // Check Root Tablebase probe first for instantaneous endgame win/draw moves
-    Move tb_root_move = MOVE_NONE;
-    Value tb_root_score = VALUE_ZERO;
-    if (Syzygy::probe_root(board, tb_root_move, tb_root_score)) {
-        std::cout << "info depth 1 score cp " << tb_root_score << " nodes 1 time 1 pv " << tb_root_move.to_uci() << std::endl;
-        std::cout << "bestmove " << tb_root_move.to_uci() << std::endl;
-        searching_.store(false);
-        return;
+    root_piece_count_ = popcount(board.occupied_bb());
+    root_tb_moves_.clear();
+    // Avoid blocking on 6-piece DTZ disk I/O if clock is critically low (< 35ms)
+    if (hard_limit_ms_ < 0 || hard_limit_ms_ >= 35 || root_piece_count_ <= 5) {
+        MoveList legal_root;
+        board.generate_legal_moves(legal_root);
+        Value tb_root_score = VALUE_ZERO;
+        if (!legal_root.empty() && Syzygy::filter_root_moves(board, legal_root, tb_root_score)) {
+            root_tb_moves_ = legal_root;
+            tb_hits_.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     int max_depth = std::min(limits_.depth, 64);
 
     helper_threads_.clear();
-    for (int i = 1; i < num_threads_; ++i) {
-        helper_threads_.emplace_back(&Search::worker_search, this, board, i, max_depth);
+    if (hard_limit_ms_ < 0 || hard_limit_ms_ >= 25) {
+        for (int i = 1; i < num_threads_; ++i) {
+            helper_threads_.emplace_back(&Search::worker_search, this, board, i, max_depth);
+        }
     }
 
     search_root(board);
@@ -561,20 +740,24 @@ void Search::search_root(Board& board) {
     Move best_move = MOVE_NONE;
     Value best_score = -VALUE_INFINITE;
 
-    std::vector<Move> root_moves;
-    board.generate_legal_moves(root_moves);
+    MoveList root_moves;
+    if (!root_tb_moves_.empty()) {
+        root_moves = root_tb_moves_;
+    } else {
+        board.generate_legal_moves(root_moves);
+    }
     if (root_moves.empty()) {
         std::cout << "bestmove 0000" << std::endl;
         return;
     }
 
-    std::vector<float> policy_logits;
-    const float* pol_ptr = nullptr;
-    if (policy_net_enabled_) {
-        Neural::g_neural_gpu.get_policy(board, policy_logits, 0);
-        pol_ptr = policy_logits.data();
+    alignas(32) float root_h2[Neural::L2_DIM];
+    const float* h2_ptr = nullptr;
+    if (policy_net_enabled_ && (hard_limit_ms_ < 0 || hard_limit_ms_ >= 15)) {
+        Neural::g_neural_gpu.evaluate_with_h2(board, root_h2, 0);
+        h2_ptr = root_h2;
     }
-    order_moves(board, main_worker_, root_moves, MOVE_NONE, 0, pol_ptr);
+    order_moves(board, main_worker_, root_moves, MOVE_NONE, 0, h2_ptr);
     best_move = root_moves[0];
 
     bool single_reply = (root_moves.size() == 1) && !limits_.infinite && (limits_.depth == 64);
@@ -582,19 +765,16 @@ void Search::search_root(Board& board) {
     int64_t prev_elapsed = 0;
 
     for (int depth = 1; depth <= max_depth; ++depth) {
-        if (target_time_ms_ > 0) {
-            auto now = std::chrono::steady_clock::now();
-            int64_t elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time_).count();
-            if (elapsed >= target_time_ms_) break;
+        if (depth > 1 && !pondering_.load(std::memory_order_relaxed) && target_time_ms_ > 0) {
+            if (elapsed_ms() >= target_time_ms_) break;
         }
         Value alpha = -VALUE_INFINITE;
         Value beta  = VALUE_INFINITE;
 
-        // Use a narrow window once the score is stable, then widen both sides
-        // geometrically after a fail. The full-window fallback guarantees
-        // progress in tactical/mate-score positions.
+        // Use a narrow window once the score is stable, then widen the failing bound
+        // geometrically after a fail.
         int delta = (depth < 8) ? aspiration_window_ : std::max(8, aspiration_window_ / 2);
-        if (depth >= 4) {
+        if (depth >= 4 && std::abs(best_score) < VALUE_MATE_THRESHOLD) {
             alpha = std::max(-VALUE_INFINITE, best_score - delta);
             beta  = std::min(VALUE_INFINITE, best_score + delta);
         }
@@ -602,15 +782,14 @@ void Search::search_root(Board& board) {
         Value score = pvs(board, main_worker_, depth, 0, alpha, beta, false);
 
         // Aspiration window fail-high or fail-low loop
-        while (!stop_flag_.load()) {
+        while (!stop_flag_.load(std::memory_order_relaxed)) {
             if (score <= alpha) {
+                beta = (alpha + beta) / 2;
                 alpha = std::max(-VALUE_INFINITE, alpha - delta);
-                beta = std::min(VALUE_INFINITE, best_score + delta);
                 delta *= 2;
                 score = pvs(board, main_worker_, depth, 0, alpha, beta, false);
             } else if (score >= beta) {
                 beta = std::min(VALUE_INFINITE, beta + delta);
-                alpha = std::max(-VALUE_INFINITE, best_score - delta);
                 delta *= 2;
                 score = pvs(board, main_worker_, depth, 0, alpha, beta, false);
             } else {
@@ -630,13 +809,13 @@ void Search::search_root(Board& board) {
             best_move = main_worker_.pv_table[0][0];
         }
 
-        auto now = std::chrono::steady_clock::now();
-        int64_t elapsed_ms = std::max(int64_t(1), std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time_).count());
-        int64_t depth_time = elapsed_ms - prev_elapsed;
-        prev_elapsed = elapsed_ms;
+        int64_t cur_elapsed = std::max(int64_t(1), elapsed_ms());
+        int64_t depth_time = std::max(int64_t(0), cur_elapsed - prev_elapsed);
+        prev_elapsed = cur_elapsed;
 
         uint64_t current_nodes = nodes_.load();
-        uint64_t nps = (current_nodes * 1000) / elapsed_ms;
+        uint64_t current_tbhits = tb_hits_.load(std::memory_order_relaxed);
+        uint64_t nps = (current_nodes * 1000) / cur_elapsed;
 
         std::cout << "info depth " << depth
                   << " seldepth " << main_worker_.seldepth
@@ -650,7 +829,8 @@ void Search::search_root(Board& board) {
         }
         std::cout << " nodes " << current_nodes
                   << " nps " << nps
-                  << " time " << elapsed_ms
+                  << " tbhits " << current_tbhits
+                  << " time " << cur_elapsed
                   << " hashfull " << g_tt.hashfull()
                   << " pv";
 
@@ -665,11 +845,11 @@ void Search::search_root(Board& board) {
 
         if (!pondering_.load(std::memory_order_relaxed)) {
             if (target_time_ms_ > 0) {
-                if (elapsed_ms >= target_time_ms_) break;
-                if (hard_limit_ms_ > 0 && depth >= 5) {
-                    if (elapsed_ms + (depth_time * 2.2) > hard_limit_ms_) {
-                        break;
-                    }
+                // Soft time limit: if we've used >= 60% of target time, don't start another iteration
+                // that would likely blow past target_time_ms_ into hard_limit_ms_.
+                if (cur_elapsed >= (target_time_ms_ * 6) / 10) break;
+                if (hard_limit_ms_ > 0 && cur_elapsed + (depth_time * 2) >= hard_limit_ms_) {
+                    break;
                 }
             }
         }

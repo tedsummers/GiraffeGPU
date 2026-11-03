@@ -28,64 +28,99 @@ void TranspositionTable::clear() {
 }
 
 void TranspositionTable::new_search() {
-    generation_++;
+    generation_ = (generation_ + 1) & 0x3F;
+}
+
+static inline size_t fast_cluster_index(uint64_t key, size_t num_clusters) {
+#if defined(__SIZEOF_INT128__)
+    return static_cast<size_t>((static_cast<__uint128_t>(key) * static_cast<__uint128_t>(num_clusters)) >> 64);
+#else
+    return key % num_clusters;
+#endif
 }
 
 bool TranspositionTable::probe(uint64_t key, TTEntry& entry) const {
     if (num_clusters_ == 0) return false;
-    size_t idx = key % num_clusters_;
+    size_t idx = fast_cluster_index(key, num_clusters_);
     const TTCluster& cluster = table_[idx];
 
     for (const TTEntry& candidate : cluster.entries) {
-        if (candidate.flag != TT_NONE && candidate.key == key) {
-            entry = candidate;
-            return true;
+        uint64_t data = candidate.data;
+        uint64_t k = candidate.key ^ data;
+        if (k == key) {
+            TTEntry decoded;
+            decoded.key = key;
+            decoded.data = data;
+            if (decoded.flag != TT_NONE) {
+                entry = decoded;
+                return true;
+            }
         }
     }
     return false;
 }
 
-void TranspositionTable::store(uint64_t key, Move move, Value score, int depth, TTFlag flag, int ply) {
+void TranspositionTable::store(uint64_t key, Move move, Value score, int depth, TTFlag flag, int ply, Value static_eval) {
     if (num_clusters_ == 0) return;
-    size_t idx = key % num_clusters_;
+    size_t idx = fast_cluster_index(key, num_clusters_);
     TTCluster& cluster = table_[idx];
 
     int target_slot = -1;
+    TTEntry existing{};
+    existing.eval = static_cast<int16_t>(VALUE_NONE);
 
     // 1. If key already exists in one of the slots, update that slot
     for (int i = 0; i < 4; ++i) {
-        if (cluster.entries[i].key == key && cluster.entries[i].flag != TT_NONE) {
-            target_slot = i;
-            break;
+        uint64_t data = cluster.entries[i].data;
+        uint64_t k = cluster.entries[i].key ^ data;
+        if (k == key) {
+            TTEntry decoded;
+            decoded.key = key;
+            decoded.data = data;
+            if (decoded.flag != TT_NONE) {
+                target_slot = i;
+                existing = decoded;
+                break;
+            }
         }
     }
 
     if (target_slot != -1) {
-        TTEntry& e = cluster.entries[target_slot];
-        if (depth >= e.depth - 2 || e.generation != generation_ || flag == TT_EXACT) {
-            e.key = key;
-            if (!move.is_null()) e.move_data = move.data;
-            e.score = static_cast<int16_t>(score_to_tt(score, ply));
-            e.depth = static_cast<int8_t>(depth);
-            e.flag = flag;
-            e.generation = generation_;
-        } else if (!move.is_null() && e.move_data == 0) {
-            e.move_data = move.data;
+        if (depth >= existing.depth - 2 || existing.generation != generation_ || flag == TT_EXACT) {
+            TTEntry updated{};
+            updated.move_data = !move.is_null() ? move.data : existing.move_data;
+            updated.score = static_cast<int16_t>(score_to_tt(score, ply));
+            updated.eval = (static_eval != VALUE_NONE) ? static_cast<int16_t>(static_eval) : existing.eval;
+            updated.depth = static_cast<int8_t>(depth);
+            updated.flag = flag;
+            updated.generation = generation_;
+            cluster.entries[target_slot].key = key ^ updated.data;
+            cluster.entries[target_slot].data = updated.data;
+        } else if ((!move.is_null() && existing.move_data == 0) ||
+                   (static_eval != VALUE_NONE && existing.eval == static_cast<int16_t>(VALUE_NONE))) {
+            if (!move.is_null() && existing.move_data == 0) existing.move_data = move.data;
+            if (static_eval != VALUE_NONE && existing.eval == static_cast<int16_t>(VALUE_NONE)) {
+                existing.eval = static_cast<int16_t>(static_eval);
+            }
+            cluster.entries[target_slot].key = key ^ existing.data;
+            cluster.entries[target_slot].data = existing.data;
         }
         return;
     }
 
-    // Replace the lowest-quality entry.  Old generations are deliberately
+    // Replace the lowest-quality entry. Old generations are deliberately
     // discounted, so a shallow result from the current search cannot evict a
     // useful deep result while stale entries do not live forever.
     int worst_quality = 1 << 30;
+    target_slot = 0;
     for (int i = 0; i < 4; ++i) {
-        const TTEntry& e = cluster.entries[i];
+        TTEntry e;
+        e.data = cluster.entries[i].data;
         if (e.flag == TT_NONE) {
             target_slot = i;
             break;
         }
-        const int age = static_cast<uint8_t>(generation_ - e.generation);
+        const int age = (generation_ - e.generation) & 0x3F;
         const int quality = static_cast<int>(e.depth) - age * 8 + (e.flag == TT_EXACT ? 4 : 0);
         if (quality < worst_quality) {
             worst_quality = quality;
@@ -93,13 +128,15 @@ void TranspositionTable::store(uint64_t key, Move move, Value score, int depth, 
         }
     }
 
-    TTEntry& e = cluster.entries[target_slot];
-    e.key = key;
-    e.move_data = move.data;
-    e.score = static_cast<int16_t>(score_to_tt(score, ply));
-    e.depth = static_cast<int8_t>(depth);
-    e.flag = flag;
-    e.generation = generation_;
+    TTEntry updated{};
+    updated.move_data = move.data;
+    updated.score = static_cast<int16_t>(score_to_tt(score, ply));
+    updated.eval = static_cast<int16_t>(static_eval);
+    updated.depth = static_cast<int8_t>(depth);
+    updated.flag = flag;
+    updated.generation = generation_;
+    cluster.entries[target_slot].key = key ^ updated.data;
+    cluster.entries[target_slot].data = updated.data;
 }
 
 Value TranspositionTable::score_to_tt(Value score, int ply) const {

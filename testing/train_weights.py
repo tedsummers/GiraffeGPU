@@ -18,6 +18,8 @@ try:
     import numpy as np
     import chess
 except ImportError:
+    if os.path.exists("/usr/bin/python3") and os.path.realpath(sys.executable) != os.path.realpath("/usr/bin/python3"):
+        os.execv("/usr/bin/python3", ["/usr/bin/python3"] + sys.argv)
     np = None
     chess = None
 
@@ -59,31 +61,39 @@ def extract_features(fen):
         out += [1.0 if b.has_kingside_castling_rights(color) else 0.0,
                 1.0 if b.has_queenside_castling_rights(color) else 0.0]
 
-    attackers = {}
-    for sq in chess.SQUARES:
-        attackers[(chess.WHITE, sq)] = list(b.attackers(chess.WHITE, sq))
-        attackers[(chess.BLACK, sq)] = list(b.attackers(chess.BLACK, sq))
-    lva = {}
-    num = {}
-    ctrl = {}
-    for color in (chess.WHITE, chess.BLACK):
-        for sq in chess.SQUARES:
-            ats = attackers[(color, sq)]
-            num[(color, sq)] = len(ats)
-            lva[(color, sq)] = min((b.piece_at(x).piece_type for x in ats), default=0,
-                                   key=lambda pt: MAT[pt])
-            ctrl[(color, sq)] = ((MAT[6] + MAT[6] // 2 - MAT[lva[(color, sq)]]) /
-                                 (MAT[6] * 2.0)) if ats else 0.0
+    w_lva = [0] * 64
+    b_lva = [0] * 64
+    w_num = [0] * 64
+    b_num = [0] * 64
+    w_ctrl = [0.0] * 64
+    b_ctrl = [0.0] * 64
+
+    inv_denom = 1.0 / (MAT[6] * 2.0)
+    base_num = float(MAT[6] + MAT[6] // 2)
+
+    for color, lva_arr, num_arr, ctrl_arr in (
+        (chess.WHITE, w_lva, w_num, w_ctrl),
+        (chess.BLACK, b_lva, b_num, b_ctrl),
+    ):
+        for pt in (chess.KING, chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT, chess.PAWN):
+            for from_sq in b.pieces(pt, color):
+                for target in b.attacks(from_sq):
+                    num_arr[target] += 1
+                    lva_arr[target] = pt
+        for sq in range(64):
+            if lva_arr[sq]:
+                ctrl_arr[sq] = (base_num - MAT[lva_arr[sq]]) * inv_denom
 
     def safe(pt, color, sq):
-        opp = lva[(not color, sq)]
-        friend = lva[(color, sq)]
+        opp = b_lva[sq] if color == chess.WHITE else w_lva[sq]
+        friend = w_lva[sq] if color == chess.WHITE else b_lva[sq]
+        n_friend = w_num[sq] if color == chess.WHITE else b_num[sq]
         if not opp or MAT[opp] >= MAT[pt]:
-            return 1 if not opp or (friend and num[(color, sq)] > 1) else 0
+            return 1 if not opp or (friend and n_friend > 1) else 0
         return 0
 
     def threat(color, sq, exists):
-        return [ctrl[(chess.WHITE, sq)], ctrl[(chess.BLACK, sq)]] if exists else [0.0, 0.0]
+        return [w_ctrl[sq], b_ctrl[sq]] if exists else [0.0, 0.0]
 
     def sliding(sq, pt, color, exists):
         dirs = ([(1, 0), (-1, 0), (0, 1), (0, -1)] if pt == chess.ROOK else
@@ -142,7 +152,7 @@ def extract_features(fen):
                 1.0 if b.has_queenside_castling_rights(color) else 0.0]
     for color in (chess.WHITE, chess.BLACK): piece_pair(chess.BISHOP, color)
     for color in (chess.WHITE, chess.BLACK): piece_pair(chess.KNIGHT, color)
-    for sq in chess.SQUARES: out += [ctrl[(chess.WHITE, sq)], ctrl[(chess.BLACK, sq)]]
+    for sq in chess.SQUARES: out += [w_ctrl[sq], b_ctrl[sq]]
     if len(out) != IN_DIM: raise ValueError(f"feature count {len(out)} != {IN_DIM}")
     return out
 
@@ -169,17 +179,43 @@ def init_default_weights():
     w_pol = [0.0] * (POLICY_DIM * L2_DIM)
     b_pol = [0.0] * POLICY_DIM
 
+    # Deterministic He/Kaiming initialization for neurons 5..511 (L1) and 2..63 (L2)
+    rng = random.Random(0x618AFFE2)
+    std_l1 = math.sqrt(2.0 / IN_DIM) * 0.25
+    std_l2 = math.sqrt(2.0 / L1_DIM) * 0.25
+    for n in range(5, L1_DIM):
+        b1[n] = 0.01
+        base = n * IN_DIM
+        for i in range(IN_DIM):
+            w1[base + i] = rng.gauss(0.0, std_l1)
+    for n in range(2, L2_DIM):
+        b2[n] = 0.01
+        base = n * L1_DIM
+        for i in range(5, L1_DIM):
+            w2[base + i] = rng.gauss(0.0, std_l2)
+
     # Material
     w1[0 * IN_DIM + 0] = 9.0; w1[0 * IN_DIM + 1] = 10.0; w1[0 * IN_DIM + 2] = 6.6; w1[0 * IN_DIM + 3] = 6.4; w1[0 * IN_DIM + 4] = 8.0
     w1[1 * IN_DIM + 5] = 9.0; w1[1 * IN_DIM + 6] = 10.0; w1[1 * IN_DIM + 7] = 6.6; w1[1 * IN_DIM + 8] = 6.4; w1[1 * IN_DIM + 9] = 8.0
 
+    # Central control, mobility, castling & tempo priors
+    central_sqs = [27, 28, 35, 36, 26, 34, 29, 37]
+    for sq in central_sqs:
+        w1[2 * IN_DIM + 235 + sq * 2] += 0.25
+        w1[3 * IN_DIM + 235 + sq * 2 + 1] += 0.25
+    for d in range(8):
+        w1[2 * IN_DIM + 102 + d] += 0.05
+        w1[3 * IN_DIM + 116 + d] += 0.05
+    w1[2 * IN_DIM + 13] += 0.15; w1[2 * IN_DIM + 14] += 0.10
+    w1[3 * IN_DIM + 17] += 0.15; w1[3 * IN_DIM + 18] += 0.10
+    w1[4 * IN_DIM + 10] = 0.15
+
     # Layer 2 & 3
-    w2[0 * L1_DIM + 0] = 1.0; w2[0 * L1_DIM + 1] = -1.0
-    w2[1 * L1_DIM + 0] = -1.0; w2[1 * L1_DIM + 1] = 1.0
+    w2[0 * L1_DIM + 0] = 1.0; w2[0 * L1_DIM + 1] = -1.0; w2[0 * L1_DIM + 2] = 1.0; w2[0 * L1_DIM + 3] = -1.0; w2[0 * L1_DIM + 4] = 1.0
+    w2[1 * L1_DIM + 0] = -1.0; w2[1 * L1_DIM + 1] = 1.0; w2[1 * L1_DIM + 2] = -1.0; w2[1 * L1_DIM + 3] = 1.0; w2[1 * L1_DIM + 4] = -1.0
     w3[0] = 0.10; w3[1] = -0.10
 
     # Policy priors for central destination squares
-    central_sqs = [27, 28, 35, 36, 26, 34, 29, 37]
     for from_sq in range(64):
         for to_sq in central_sqs:
             b_pol[(from_sq << 6) | to_sq] += 0.40
@@ -187,8 +223,7 @@ def init_default_weights():
     def set_prior(from_sq, to_sq, value):
         b_pol[(from_sq << 6) | to_sq] += value
 
-    # Keep the Python trainer's legacy-weight policy exactly aligned with the
-    # C++ built-in policy used when loading GIRAFGPU files.
+    # Keep the Python trainer's legacy-weight policy aligned with the C++ built-in policy
     for from_sq, to_sq, value in [
         (12, 28, 2.5), (11, 27, 2.5), (6, 21, 2.0), (1, 18, 1.8),
         (10, 26, 1.8), (4, 6, 2.0), (4, 2, 1.5),
@@ -207,6 +242,11 @@ def init_default_weights():
 
     return w1, b1, w2, b2, w3, b3, w_pol, b_pol
 
+def _wake_dead_neurons(w1, b1, w2, b2, w3, b3, w_pol, b_pol):
+    if any(abs(w1[n * IN_DIM]) > 1e-7 for n in range(5, L1_DIM)) and (abs(w3[0]) >= 0.05 or abs(w3[1]) >= 0.05):
+        return w1, b1, w2, b2, w3, b3, w_pol, b_pol
+    return init_default_weights()
+
 def load_weights(path):
     if not os.path.exists(path):
         return init_default_weights()
@@ -221,7 +261,7 @@ def load_weights(path):
             b3 = list(struct.unpack(f"{OUT_DIM}f", f.read(OUT_DIM * 4)))
             w_pol = list(struct.unpack(f"{POLICY_DIM * L2_DIM}f", f.read(POLICY_DIM * L2_DIM * 4)))
             b_pol = list(struct.unpack(f"{POLICY_DIM}f", f.read(POLICY_DIM * 4)))
-            return w1, b1, w2, b2, w3, b3, w_pol, b_pol
+            return _wake_dead_neurons(w1, b1, w2, b2, w3, b3, w_pol, b_pol)
         elif magic == MAGIC_GPU:
             w1 = list(struct.unpack(f"{IN_DIM * L1_DIM}f", f.read(IN_DIM * L1_DIM * 4)))
             b1 = list(struct.unpack(f"{L1_DIM}f", f.read(L1_DIM * 4)))
@@ -230,7 +270,7 @@ def load_weights(path):
             w3 = list(struct.unpack(f"{L2_DIM * OUT_DIM}f", f.read(L2_DIM * OUT_DIM * 4)))
             b3 = list(struct.unpack(f"{OUT_DIM}f", f.read(OUT_DIM * 4)))
             _, _, _, _, _, _, w_pol, b_pol = init_default_weights()
-            return w1, b1, w2, b2, w3, b3, w_pol, b_pol
+            return _wake_dead_neurons(w1, b1, w2, b2, w3, b3, w_pol, b_pol)
         else:
             return init_default_weights()
 
@@ -249,7 +289,7 @@ def save_weights(path, w1, b1, w2, b2, w3, b3, w_pol, b_pol):
 
 def train_on_dataset(data_path, in_weights_path, out_weights_path, epochs=3, lr=0.00025,
                      policy_lr=0.0, max_output_delta=0.02, seed=1337,
-                     outcome_weight=0.7, eval_scale=400.0, holdout=0.2):
+                     outcome_weight=0.7, eval_scale=400.0, holdout=0.2, max_samples_limit=50000):
     w1, b1, w2, b2, w3, b3, w_pol, b_pol = load_weights(in_weights_path)
     base_policy_bias = list(b_pol)
 
@@ -301,9 +341,13 @@ def train_on_dataset(data_path, in_weights_path, out_weights_path, epochs=3, lr=
     random.seed(seed)
     np.random.seed(seed)
     random.shuffle(samples)
-    max_samples = min(len(samples), 200000)
+    max_samples = min(len(samples), max_samples_limit)
     samples = samples[:max_samples]
-    features = np.asarray([extract_features(item[0]) for item in samples], dtype=np.float32)
+    import multiprocessing as mp
+    num_workers = max(1, min(8, os.cpu_count() or 1))
+    with mp.Pool(processes=num_workers) as pool:
+        feat_list = pool.map(extract_features, [item[0] for item in samples], chunksize=256)
+    features = np.asarray(feat_list, dtype=np.float32)
     targets = np.asarray([item[1] for item in samples], dtype=np.float32)
     policy_indices = [item[2] for item in samples]
     w1n = np.asarray(w1, dtype=np.float32).reshape((L1_DIM, IN_DIM))
@@ -312,9 +356,18 @@ def train_on_dataset(data_path, in_weights_path, out_weights_path, epochs=3, lr=
     b2n = np.asarray(b2, dtype=np.float32)
     w3n = np.asarray(w3, dtype=np.float32)
     b3n = np.asarray(b3, dtype=np.float32)
+    w_poln = np.asarray(w_pol, dtype=np.float32).reshape((POLICY_DIM, L2_DIM))
+    b_poln = np.asarray(b_pol, dtype=np.float32)
+
+    base_w1n = w1n.copy()
+    base_b1n = b1n.copy()
+    base_w2n = w2n.copy()
+    base_b2n = b2n.copy()
     base_w3n = w3n.copy()
     base_b3n = b3n.copy()
-    base_policy_bias = np.asarray(b_pol, dtype=np.float32).copy()
+    base_w_poln = w_poln.copy()
+    base_policy_bias = b_poln.copy()
+
     batch_size = 1024
     split = max(1, min(len(features) - 1, int(len(features) * (1.0 - holdout))))
     split_order = np.random.permutation(len(features))
@@ -330,43 +383,90 @@ def train_on_dataset(data_path, in_weights_path, out_weights_path, epochs=3, lr=
     print(f"Training split: {len(train_idx)} train / {len(val_idx)} validation samples")
     print(f"Initial validation MSE: {initial_val_mse:.6f}")
 
+    best_val_mse = initial_val_mse
+    best_weights = (w1n.copy(), b1n.copy(), w2n.copy(), b2n.copy(), w3n.copy(), b3n.copy(), w_poln.copy(), b_poln.copy())
+
     for ep in range(1, epochs + 1):
         total_loss = 0.0
         policy_updates = 0
         order = np.random.permutation(train_idx)
         for start in range(0, len(order), batch_size):
             idx = order[start:start + batch_size]
+            bs = float(len(idx))
             x = features[idx]
-            h1 = np.maximum(0.0, x @ w1n.T + b1n)
-            h2 = np.maximum(0.0, h1 @ w2n.T + b2n)
+            z1 = x @ w1n.T + b1n
+            h1 = np.maximum(0.0, z1)
+            z2 = h1 @ w2n.T + b2n
+            h2 = np.maximum(0.0, z2)
             pred = np.tanh(h2 @ w3n + b3n[0])
             err = pred - targets[idx]
             total_loss += float(np.sum(err * err))
 
-            grad = ((1.0 - pred * pred) * err).astype(np.float32)
-            # Train the output layer with real position-dependent activations.
-            w3n -= (lr * 0.1) * (h2.T @ grad) / len(idx)
-            b3n[0] -= (lr * 0.1) * float(np.mean(grad))
+            grad_out = ((1.0 - pred * pred) * err).astype(np.float32) # (B,)
 
-            # A self-play batch is noisy. Keep each candidate close to the
-            # current master network so one cycle cannot cause a large Elo drop.
+            # Gradients for L3 (Value Head)
+            grad_w3 = (h2.T @ grad_out) / bs
+            grad_b3 = float(np.mean(grad_out))
+
+            # Backpropagate into L2 and L1
+            grad_h2 = np.outer(grad_out, w3n) * (z2 > 0.0) # (B, L2_DIM)
+            grad_w2 = (grad_h2.T @ h1) / bs
+            grad_b2 = np.mean(grad_h2, axis=0)
+
+            grad_h1 = (grad_h2 @ w2n) * (z1 > 0.0) # (B, L1_DIM)
+            grad_w1 = (grad_h1.T @ x) / bs
+            grad_b1 = np.mean(grad_h1, axis=0)
+
+            # Preserve hand-crafted material/positional trunk anchor in neurons 0..4 (L1) and 0..1 (L2)
+            # and keep w3[0], w3[1] anchored to the material difference scale while learning residual features on neurons 2..63
+            grad_w1[:5, :] = 0.0
+            grad_b1[:5] = 0.0
+            grad_w2[:2, :] = 0.0
+            grad_b2[:2] = 0.0
+            grad_w3[:2] *= 0.05
+
+            w3n -= (lr * 0.25) * grad_w3
+            b3n[0] -= (lr * 0.25) * grad_b3
+            w2n -= (lr * 0.5) * grad_w2
+            b2n -= (lr * 0.5) * grad_b2
+            w1n -= (lr * 0.5) * grad_w1
+            b1n -= (lr * 0.5) * grad_b1
+
+            # Bound per-cycle drift so noisy self-play batches cannot destabilize master weights
             w3n[:] = np.clip(w3n, base_w3n - max_output_delta, base_w3n + max_output_delta)
             b3n[:] = np.clip(b3n, base_b3n - max_output_delta, base_b3n + max_output_delta)
+            w2n[:] = np.clip(w2n, base_w2n - max_output_delta, base_w2n + max_output_delta)
+            b2n[:] = np.clip(b2n, base_b2n - max_output_delta, base_b2n + max_output_delta)
+            w1n[:] = np.clip(w1n, base_w1n - max_output_delta, base_w1n + max_output_delta)
+            b1n[:] = np.clip(b1n, base_b1n - max_output_delta, base_b1n + max_output_delta)
 
-        # Policy bias updates remain deliberately small and bounded.
-        for pol_idx in policy_indices:
-            if policy_lr > 0.0 and pol_idx is not None and 0 <= pol_idx < POLICY_DIM:
-                b_pol[pol_idx] = max(base_policy_bias[pol_idx] - 0.25,
-                                     min(base_policy_bias[pol_idx] + 0.25,
-                                         b_pol[pol_idx] + policy_lr))
-                policy_updates += 1
+            # Context-aware Policy Head updates using L2 activations h2
+            if policy_lr > 0.0:
+                for b_i, sample_i in enumerate(idx):
+                    pol_idx = policy_indices[sample_i]
+                    if pol_idx is not None and 0 <= pol_idx < POLICY_DIM:
+                        w_poln[pol_idx] = np.clip(
+                            w_poln[pol_idx] + (policy_lr * 0.1) * h2[b_i],
+                            base_w_poln[pol_idx] - 0.05,
+                            base_w_poln[pol_idx] + 0.05,
+                        )
+                        b_poln[pol_idx] = np.clip(
+                            b_poln[pol_idx] + policy_lr,
+                            base_policy_bias[pol_idx] - 0.25,
+                            base_policy_bias[pol_idx] + 0.25,
+                        )
+                        policy_updates += 1
 
         mse = total_loss / len(train_idx)
         val_mse = float(np.mean((predict(features[val_idx]) - targets[val_idx]) ** 2))
         print(f"  Epoch {ep}/{epochs}: Train MSE = {mse:.6f} | Validation MSE = {val_mse:.6f} | Policy updates = {policy_updates}")
+        if val_mse <= best_val_mse:
+            best_val_mse = val_mse
+            best_weights = (w1n.copy(), b1n.copy(), w2n.copy(), b2n.copy(), w3n.copy(), b3n.copy(), w_poln.copy(), b_poln.copy())
 
-    save_weights(out_weights_path, w1n.ravel(), b1n, w2n.ravel(), b2n,
-                 w3n, b3n, w_pol, b_pol)
+    bw1, bb1, bw2, bb2, bw3, bb3, bw_pol, bb_pol = best_weights
+    save_weights(out_weights_path, bw1.ravel(), bb1, bw2.ravel(), bb2,
+                 bw3, bb3, bw_pol.ravel(), bb_pol)
     print(f"Dual-Head weights successfully saved to: {out_weights_path}")
 
 def main():
@@ -388,6 +488,8 @@ def main():
                         help="Fraction reserved for validation")
     parser.add_argument("--policy-lr", type=float, default=0.0,
                         help="Global policy-bias learning rate; 0 disables unsafe context-free updates")
+    parser.add_argument("--max-samples", type=int, default=50000,
+                        help="Maximum positions to sample per training cycle")
 
     args = parser.parse_args()
 
@@ -396,7 +498,8 @@ def main():
                      max_output_delta=args.max_output_delta, seed=args.seed,
                      outcome_weight=max(0.0, min(1.0, args.outcome_weight)),
                      eval_scale=max(1.0, args.eval_scale),
-                     holdout=max(0.05, min(0.5, args.holdout)))
+                     holdout=max(0.05, min(0.5, args.holdout)),
+                     max_samples_limit=max(1000, args.max_samples))
 
 if __name__ == "__main__":
     main()

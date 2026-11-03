@@ -60,7 +60,7 @@ Examples:
     parser.add_argument("--compare-policy", action="store_true", help="Run A/B match comparing PolicyNet enabled vs disabled")
     parser.add_argument("--engine2", default=None, help="Opponent / baseline engine binary")
     parser.add_argument("--games", type=int, default=20, help="Number of games to play (default: 20)")
-    parser.add_argument("--tc", default="5+0.1", help="Time control for match (default: 5+0.1)")
+    parser.add_argument("--tc", default="60+0.5", help="Time control for match (default: 60+0.5)")
     parser.add_argument("--elo0", type=float, default=0.0, help="SPRT H0 Elo bound")
     parser.add_argument("--elo1", type=float, default=10.0, help="SPRT H1 Elo bound")
 

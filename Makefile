@@ -14,8 +14,8 @@ CPP_OBJS = $(patsubst $(SRC_DIR)/%.cpp, $(OBJ_DIR)/%.o, $(CPP_SRCS))
 C_OBJS   = $(patsubst $(SRC_DIR)/syzygy/%.c, $(OBJ_DIR)/syzygy/%.o, $(C_SRCS))
 CU_OBJS  = $(patsubst $(SRC_DIR)/cuda/%.cu, $(OBJ_DIR)/cuda/%.o, $(CU_SRCS))
 
-CFLAGS   = -O3 -march=native -Wall -Wextra -pthread -I$(SRC_DIR)
-CXXFLAGS = -O3 -march=native -std=c++17 -Wall -Wextra -pthread -I$(SRC_DIR) -I/opt/cuda/include
+CFLAGS   = -O3 -march=native -MMD -MP -Wall -Wextra -pthread -I$(SRC_DIR)
+CXXFLAGS = -O3 -march=native -MMD -MP -std=c++17 -Wall -Wextra -pthread -I$(SRC_DIR) -I/opt/cuda/include
 NVCCFLAGS = -O3 -std=c++17 -I$(SRC_DIR) -I/opt/cuda/include \
             -gencode arch=compute_86,code=sm_86 \
             -gencode arch=compute_120,code=sm_120 \
@@ -54,8 +54,8 @@ WIN_TARGET = GiraffeGPU.exe
 
 windows: $(OBJ_DIR)
 	@echo "Building Windows 64-bit standalone executable ($(WIN_TARGET))..."
-	$(ZIG) cc -target x86_64-windows-gnu -O3 -I$(SRC_DIR) -pthread -c $(C_SRCS) -o $(OBJ_DIR)/tbprobe_win.o
-	$(ZIG) c++ -target x86_64-windows-gnu -O3 -std=c++17 -I$(SRC_DIR) -pthread $(CPP_SRCS) $(OBJ_DIR)/tbprobe_win.o -o $(WIN_TARGET)
+	$(ZIG) cc -target x86_64-windows-gnu -O3 -march=x86_64_v3 -I$(SRC_DIR) -pthread -c $(C_SRCS) -o $(OBJ_DIR)/tbprobe_win.o
+	$(ZIG) c++ -target x86_64-windows-gnu -O3 -march=x86_64_v3 -std=c++17 -I$(SRC_DIR) -pthread $(CPP_SRCS) $(OBJ_DIR)/tbprobe_win.o -o $(WIN_TARGET)
 	@echo "============================================="
 	@echo "Build successful: ./$(WIN_TARGET)"
 	@echo "============================================="
@@ -83,5 +83,7 @@ autonomous-daemon:
 
 autonomous-status:
 	python3 testing/autonomous_5day.py --status
+
+-include $(CPP_OBJS:.o=.d) $(C_OBJS:.o=.d)
 
 .PHONY: all clean windows windows-cuda test-epd test-tactics test-selfplay autonomous-5day autonomous-daemon autonomous-status

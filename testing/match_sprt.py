@@ -112,7 +112,7 @@ def resolve_path(p):
     if os.path.exists(cand2): return cand2
     return os.path.abspath(p)
 
-def run_match(engine1_path, engine2_path, games=20, tc="10+0.1", book_path=None, concurrency=1,
+def run_match(engine1_path, engine2_path, games=20, tc="60+0.5", book_path=None, concurrency=1,
               elo0=0.0, elo1=10.0, sprt_mode=False, engine1_options=None, engine2_options=None):
 
     engine1_path = resolve_path(engine1_path)
@@ -263,7 +263,7 @@ def main():
     parser.add_argument("--engine2-options", default=None, help="UCI options for engine 2 (e.g. PolicyNet=false)")
     parser.add_argument("--compare-policy", action="store_true", help="Direct A/B match comparing PolicyNet enabled vs disabled")
     parser.add_argument("--games", type=int, default=20, help="Number of games to play (default: 20)")
-    parser.add_argument("--tc", default="5+0.1", help="Time control (default: 5+0.1)")
+    parser.add_argument("--tc", default="60+0.5", help="Time control (default: 60+0.5)")
     parser.add_argument("--book", default="testing/books/openings.epd", help="Opening book (.epd or .pgn)")
     parser.add_argument("--concurrency", type=int, default=1, help="Concurrent games (default: 1)")
     parser.add_argument("--sprt", action="store_true", help="Enable SPRT stopping conditions")

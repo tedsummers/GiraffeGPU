@@ -17,6 +17,8 @@ from datetime import datetime
 try:
     import chess
 except ImportError:
+    if os.path.exists("/usr/bin/python3") and os.path.realpath(sys.executable) != os.path.realpath("/usr/bin/python3"):
+        os.execv("/usr/bin/python3", ["/usr/bin/python3"] + sys.argv)
     chess = None
 
 def resolve_engine_path(p):
@@ -123,10 +125,14 @@ def get_random_opening(engine, plies=6):
         board.push(move)
     return moves
 
-def play_selfplay_game(engine_path, movetime=100, random_plies=6, max_moves=100, engine_options=None):
+def play_selfplay_game(engine_or_path, movetime=100, random_plies=6, max_moves=100, engine_options=None):
     if chess is None:
         raise RuntimeError("python-chess is required for self-play dataset generation")
-    engine = UCIEngineInstance(engine_path, engine_options=engine_options)
+    owns_engine = isinstance(engine_or_path, str)
+    engine = UCIEngineInstance(engine_or_path, engine_options=engine_options) if owns_engine else engine_or_path
+    engine.send("ucinewgame")
+    engine.send("isready")
+    engine.wait_for("readyok")
 
     moves_history = get_random_opening(engine, plies=random_plies)
     board = chess.Board()
@@ -139,6 +145,16 @@ def play_selfplay_game(engine_path, movetime=100, random_plies=6, max_moves=100,
     res_val = 0.5
 
     for ply in range(len(moves_history), max_moves * 2):
+        if board.is_game_over(claim_draw=True):
+            outcome = board.outcome(claim_draw=True)
+            if outcome and outcome.winner == chess.WHITE:
+                result, res_val = "1-0", 1.0
+            elif outcome and outcome.winner == chess.BLACK:
+                result, res_val = "0-1", 0.0
+            else:
+                result, res_val = "1/2-1/2", 0.5
+            break
+
         position_fen = board.fen()
         moves_str = " ".join(moves_history)
         engine.send(f"position startpos moves {moves_str}")
@@ -171,13 +187,14 @@ def play_selfplay_game(engine_path, movetime=100, random_plies=6, max_moves=100,
 
         if not best_move or best_move == "0000" or best_move == "(none)":
             # Checkmate or stalemate
-            side_to_move = (ply % 2) # 0 = White, 1 = Black
-            if side_to_move == 0:
-                result = "0-1"
-                res_val = 0.0
+            if board.is_check():
+                side_to_move = (ply % 2) # 0 = White, 1 = Black
+                if side_to_move == 0:
+                    result, res_val = "0-1", 0.0
+                else:
+                    result, res_val = "1-0", 1.0
             else:
-                result = "1-0"
-                res_val = 1.0
+                result, res_val = "1/2-1/2", 0.5
             break
 
         game_positions.append({
@@ -202,7 +219,8 @@ def play_selfplay_game(engine_path, movetime=100, random_plies=6, max_moves=100,
             res_val = 0.0 if result == "0-1" else 1.0
             break
 
-    engine.close()
+    if owns_engine:
+        engine.close()
 
     # Annotate positions with final outcome
     for pos in game_positions:
@@ -250,31 +268,35 @@ def main():
     total_positions = 0
     t0 = time.time()
 
-    with open(output_path, "a") as f_out:
-        for g in range(1, args.games + 1):
-            g_start = time.time()
-            game_data = play_selfplay_game(args.engine, movetime=args.movetime,
-                                           random_plies=args.random_plies,
-                                           max_moves=args.max_moves,
-                                           engine_options=engine_options)
-            g_time = time.time() - g_start
+    engine = UCIEngineInstance(args.engine, engine_options=engine_options)
+    try:
+        with open(output_path, "a") as f_out:
+            for g in range(1, args.games + 1):
+                g_start = time.time()
+                game_data = play_selfplay_game(engine, movetime=args.movetime,
+                                               random_plies=args.random_plies,
+                                               max_moves=args.max_moves,
+                                               engine_options=engine_options)
+                g_time = time.time() - g_start
 
-            for pos in game_data["positions"]:
-                record = {
-                    "game_id": g,
-                    "ply": pos["ply"],
-                    "fen": pos["fen"],
-                    "side": pos["side"],
-                    "move": pos["move"],
-                    "eval_cp": pos["eval_cp"],
-                    "depth": pos["depth"],
-                    "target_outcome": pos["target_outcome"],
-                    "game_result": game_data["result"]
-                }
-                f_out.write(json.dumps(record) + "\n")
-                total_positions += 1
+                for pos in game_data["positions"]:
+                    record = {
+                        "game_id": g,
+                        "ply": pos["ply"],
+                        "fen": pos["fen"],
+                        "side": pos["side"],
+                        "move": pos["move"],
+                        "eval_cp": pos["eval_cp"],
+                        "depth": pos["depth"],
+                        "target_outcome": pos["target_outcome"],
+                        "game_result": game_data["result"]
+                    }
+                    f_out.write(json.dumps(record) + "\n")
+                    total_positions += 1
 
-            print(f"Game {g:>3}/{args.games}: {game_data['result']:<7} ({game_data['plies']} plies, {len(game_data['positions'])} positions, {g_time:.1f}s)")
+                print(f"Game {g:>3}/{args.games}: {game_data['result']:<7} ({game_data['plies']} plies, {len(game_data['positions'])} positions, {g_time:.1f}s)")
+    finally:
+        engine.close()
 
     total_elapsed = time.time() - t0
     print("\n" + "=" * 55)

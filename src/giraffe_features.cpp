@@ -35,33 +35,52 @@ bool AttackMaps::is_safe(PieceType pt, Color c, Square sq) const {
 void compute_attack_maps(const Board& board, AttackMaps& maps) {
     Bitboard occ = board.occupied_bb();
 
-    for (Square sq = SQ_A1; sq <= SQ_H8; sq = static_cast<Square>(sq + 1)) {
-        // White attackers
-        Bitboard wAtk = board.attackers_to(sq, WHITE, occ);
-        maps.whiteNumAtk[sq] = static_cast<uint8_t>(popcount(wAtk));
-        Square dummy;
-        maps.whiteLVA[sq] = board.least_valuable_attacker(sq, WHITE, occ, dummy);
-
-        // Black attackers
-        Bitboard bAtk = board.attackers_to(sq, BLACK, occ);
-        maps.blackNumAtk[sq] = static_cast<uint8_t>(popcount(bAtk));
-        maps.blackLVA[sq] = board.least_valuable_attacker(sq, BLACK, occ, dummy);
-
-        // Control values
-        if (maps.whiteLVA[sq] == NO_PIECE_TYPE) {
-            maps.whiteCtrl[sq] = 0.0f;
-        } else {
-            float val = static_cast<float>(GIRAFFE_MAT[KING] + GIRAFFE_MAT[KING] / 2 - GIRAFFE_MAT[maps.whiteLVA[sq]]);
-            maps.whiteCtrl[sq] = val / (static_cast<float>(GIRAFFE_MAT[KING]) * 2.0f);
-        }
-
-        if (maps.blackLVA[sq] == NO_PIECE_TYPE) {
-            maps.blackCtrl[sq] = 0.0f;
-        } else {
-            float val = static_cast<float>(GIRAFFE_MAT[KING] + GIRAFFE_MAT[KING] / 2 - GIRAFFE_MAT[maps.blackLVA[sq]]);
-            maps.blackCtrl[sq] = val / (static_cast<float>(GIRAFFE_MAT[KING]) * 2.0f);
-        }
+    for (int sq = 0; sq < 64; ++sq) {
+        maps.whiteLVA[sq] = NO_PIECE_TYPE;
+        maps.blackLVA[sq] = NO_PIECE_TYPE;
+        maps.whiteNumAtk[sq] = 0;
+        maps.blackNumAtk[sq] = 0;
     }
+
+    auto accumulate_color = [&](Color c, PieceType* lva, uint8_t* numAtk, float* ctrl) {
+        // Iterate from King down to Pawn so lower-valued attackers overwrite higher-valued ones in lva[]
+        // and every individual attacker increments numAtk[target]
+        const PieceType order[6] = { KING, QUEEN, ROOK, BISHOP, KNIGHT, PAWN };
+        for (PieceType pt : order) {
+            Bitboard bb = board.piece_type_bb(pt, c);
+            while (bb) {
+                Square from = pop_lsb(bb);
+                Bitboard att = 0;
+                switch (pt) {
+                    case PAWN:   att = Bitboards::PAWN_ATTACKS[c][from]; break;
+                    case KNIGHT: att = Bitboards::KNIGHT_ATTACKS[from]; break;
+                    case BISHOP: att = Bitboards::bishop_attacks(from, occ); break;
+                    case ROOK:   att = Bitboards::rook_attacks(from, occ); break;
+                    case QUEEN:  att = Bitboards::queen_attacks(from, occ); break;
+                    case KING:   att = Bitboards::KING_ATTACKS[from]; break;
+                    default: break;
+                }
+                while (att) {
+                    Square target = pop_lsb(att);
+                    numAtk[target]++;
+                    lva[target] = pt;
+                }
+            }
+        }
+
+        constexpr float inv_denom = 1.0f / (static_cast<float>(20000) * 2.0f);
+        constexpr float base_num = static_cast<float>(20000 + 20000 / 2);
+        for (int sq = 0; sq < 64; ++sq) {
+            if (lva[sq] == NO_PIECE_TYPE) {
+                ctrl[sq] = 0.0f;
+            } else {
+                ctrl[sq] = (base_num - static_cast<float>(GIRAFFE_MAT[lva[sq]])) * inv_denom;
+            }
+        }
+    };
+
+    accumulate_color(WHITE, maps.whiteLVA, maps.whiteNumAtk, maps.whiteCtrl);
+    accumulate_color(BLACK, maps.blackLVA, maps.blackNumAtk, maps.blackCtrl);
 }
 
 // Helpers for pushing features into the vector

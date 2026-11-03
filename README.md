@@ -203,7 +203,7 @@ Launch `./GiraffeGPU` (Linux) or `.\GiraffeGPU.exe` (Windows) directly:
 - `uci` - Returns engine identity and available configuration options.
 - `isready` - Confirms CUDA initialization on the selected GPU device.
 - `setoption name Device_GPU value <id>` - Selects GPU: `-1` (default) for **Both GPUs in parallel**, or `0` for GPU 0 only (RTX 3060), or `1` for GPU 1 only (RTX 5050).
-- `setoption name Threads value <num>` - Sets search worker threads (default `2` to saturate both GPUs concurrently).
+- `setoption name Threads value <num>` - Sets search worker threads (default `4` across 4 parallel CUDA streams on both GPUs).
 - `setoption name Hash value <MB>` - Sets transposition table size in MB (e.g., `256` or `1024`).
 - `setoption name BatchSize value <size>` - Sets maximum GPU evaluation batch size.
 - `setoption name PolicyNet value <true/false>` - Enables or disables Dual-Head Policy Network move ordering and LMR guidance (default: `true`).
@@ -212,7 +212,8 @@ Launch `./GiraffeGPU` (Linux) or `.\GiraffeGPU.exe` (Windows) directly:
 - `setoption name LMRMovesThreshold value <moves>` - Number of ordered moves searched before LMR begins (default: `3`).
 - `setoption name LMRDepthThreshold value <depth>` - Minimum depth at which LMR is enabled (default: `3`).
 - `setoption name ProbCutMargin value <cp>` - Extra margin used by capture ProbCut (default: `180`).
-- `setoption name SyzygyPath value <path>` - Path to Syzygy 3-4-5-6 piece tablebases (WDL and DTZ files, separated by semicolons or colons).
+- `setoption name MoveOverhead value <ms>` - Safety overhead per move in milliseconds for clock management (default: `30`).
+- `setoption name SyzygyPath value <path>` - Path to Syzygy 3-4-5-6 piece tablebases (default: `/run/media/idiot/7c8982f6-9be0-4312-be37-be9200f3cead/syzygy`).
 - `setoption name Ponder value <true/false>` - Enables or disables pondering on opponent's time (default: `true`).
 - `setoption name WeightsFile value <path>` - Loads custom Giraffe network weights (supports both `GIRAFDUAL` and legacy `GIRAFGPU` formats).
 - `ucinewgame` - Resets transposition table and board state for a new game.
@@ -255,16 +256,16 @@ Runs automated head-to-head matches between two engine versions or against exter
 
 ```bash
 # Run a 20-game match with opening book and alternating colors:
-python3 testing/run_tests.py --match --engine ./GiraffeGPU --engine2 /path/to/opponent --games 20 --tc 5+0.1
+python3 testing/run_tests.py --match --engine ./GiraffeGPU --engine2 /path/to/opponent --games 20 --tc 60+0.5
 
 # Run SPRT test (stops early as soon as Elo gain/regression is statistically proven at 95% confidence):
 python3 testing/run_tests.py --sprt --engine ./GiraffeGPU_candidate --engine2 ./GiraffeGPU_base --elo0 0.0 --elo1 10.0
 
 # Run direct A/B match isolating the Dual-Head Policy Network (PolicyNet On vs Off):
-python3 testing/run_tests.py --compare-policy --games 20 --tc 5+0.1
+python3 testing/run_tests.py --compare-policy --games 20 --tc 60+0.5
 
 # SPRT statistical validation for the Policy Network:
-python3 testing/run_tests.py --compare-policy --sprt --elo0 0.0 --elo1 15.0 --games 100 --tc 3+0.05
+python3 testing/run_tests.py --compare-policy --sprt --elo0 0.0 --elo1 15.0 --games 100 --tc 60+0.5
 ```
 - Real-time scoreboard with **Elo difference**, **95% confidence error margins ($\pm$)**, **Likelihood of Superiority (LOS %)**, and **Log-Likelihood Ratio (LLR)**.
 - Supports custom UCI engine parameters via `--engine1-options` and `--engine2-options` (e.g. `PolicyNet=true`, `WeightsFile=candidate.net`).
@@ -302,7 +303,7 @@ python3 testing/train_weights.py --data testing/results/selfplay_dataset.jsonl \
 Uses Simultaneous Perturbation Stochastic Approximation to optimize search and pruning parameters (null move reduction, LMR thresholds, aspiration window margins, SEE margins):
 
 ```bash
-    python3 testing/run_tests.py --spsa --iters 20 --spsa-games 8 --tc 3+0.05
+    python3 testing/run_tests.py --spsa --iters 20 --spsa-games 8 --tc 60+0.5
 
 The SPSA tuner runs real `cutechess-cli` matches between the plus and minus
 parameter vectors and records every iteration in
@@ -322,9 +323,9 @@ GiraffeGPU includes a fully automated, 120-hour (5-day) self-improvement daemon 
 
 ```mermaid
 flowchart TD
-    A["Dual-GPU Self-Play\n(Generate ~15,000 games/day with opening randomization)"] --> B["Data Extraction & Replay Buffer\n(Extract 363-dim features + TD(λ) game outcomes)"]
+    A["Dual-GPU Self-Play\n(Generate self-play games with opening randomization)"] --> B["Data Extraction & Replay Buffer\n(Extract 363-dim features + TD(λ) game outcomes)"]
     B --> C["Neural Network Retraining\n(Blended FEN-aware value targets)"]
-    C --> D["Automated SPRT Gauntlet\n(Candidate vs Baseline: 100+ games at 3+0.05)"]
+    C --> D["Automated SPRT Gauntlet\n(Candidate vs Baseline: 40-game cycles at 60+0.5)"]
     D -- "PASS (Elo gain confirmed at 95% CI)" --> E["Promote Candidate to Master\n(Update eval.net & recompile binaries)"]
     D -- "FAIL (No statistical gain)" --> F["Revert & Perturb Parameters\n(SPSA Search Tuning)"]
     E --> A
@@ -335,12 +336,12 @@ flowchart TD
 
 | Day | Focus Area | What the Daemon Executes | Expected Elo Gain |
 | :--- | :--- | :--- | :--- |
-| **Day 1** | **Search Parameter Optimization (SPSA)** | Automated tuning of search heuristics using `tune_spsa.py`: Late Move Reductions (LMR), Null-Move $R$ margins, Aspiration Window size, and Killer/History table weights. | **+40 to +70 Elo** |
-| **Day 2** | **Tactical Distillation & Opening Tuning** | Generate games against reference engines to train the 363-dim network to eliminate opening blunders and tactical oversights. | **+60 to +100 Elo** |
-| **Day 3** | **Large-Scale Dual-GPU Self-Play** | Continuous self-play using both GPUs (~25,000 games) starting from 6–10 ply randomized positions from `testing/books/openings.epd`. | **+50 to +80 Elo** |
-| **Day 4** | **FEN-Aware Value Training** | Train the value output layer using blended white-perspective search and game-result targets, with a held-out validation split. | **Measured by SPRT** |
-| **Day 5** | **Validation & Packaging** | Run the SPRT gauntlet and EPD benchmarks. Linux is rebuilt locally; the native Windows CUDA binary is built on Windows with `build_windows_cuda.ps1`. | **Measured by SPRT** |
-| **Total** | | | **No guaranteed Elo gain** |
+| **Day 1** | **Search Parameter Optimization (SPSA)** | Automated tuning of search heuristics using `tune_spsa.py` (`5` iterations $\times$ `6` games per cycle at `60+0.5`): Late Move Reductions (LMR), Null-Move $R$ margins, Aspiration Window size, and ProbCut margins. | **Measured by SPSA** |
+| **Day 2** | **Tactical Distillation & Opening Tuning** | Self-play generation (50 games/cycle), FEN-aware value fine-tuning, and 40-game SPRT verification matches at `60+0.5` (~2 hrs/cycle). | **Measured by SPRT** |
+| **Day 3** | **Large-Scale Dual-GPU Self-Play** | Continuous dual-GPU self-play starting from randomized opening positions (`testing/books/openings.epd`) with SPRT gating at `60+0.5`. | **Measured by SPRT** |
+| **Day 4** | **FEN-Aware Value Training** | Train the value output layer using blended white-perspective search and game-result targets, with an 80/20 validation split and `60+0.5` SPRT matches. | **Measured by SPRT** |
+| **Day 5** | **Validation & Packaging** | Run final self-play, Bratko-Kopec (`bk.epd`) & tactical (`tactics.epd`) benchmarks, and package updated binaries (`GiraffeGPU` and `GiraffeGPU.exe`). | **Measured by EPD/SPRT** |
+| **Total** | **120 Hours (5 Days)** | **~55–65 Full Cycles at `60+0.5` (1 min + 0.5s/move)** | **Statistically Gated** |
 
 #### Commands to Run and Monitor
 
@@ -374,9 +375,9 @@ GiraffeGPU can play against other engines using `cutechess-cli`:
 
 ```bash
 cutechess-cli \
-  -engine cmd=/home/idiot/Chess/GiraffeGPU/GiraffeGPU name=GiraffeGPU \
+  -engine cmd=/home/idiot/GiraffeGPU/GiraffeGPU name=GiraffeGPU \
   -engine cmd=/path/to/other/engine name=Opponent \
-  -each proto=uci tc=10+0.1 -rounds 10 -concurrency 1
+  -each proto=uci tc=60+0.5 -rounds 10 -concurrency 1
 ```
 
 ---

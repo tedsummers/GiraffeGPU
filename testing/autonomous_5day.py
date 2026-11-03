@@ -61,7 +61,8 @@ def save_state(state):
 class AutonomousPipeline:
     def __init__(self, duration_hours=120, quick_test=False):
         self.quick_test = quick_test
-        self.duration_seconds = 300 if quick_test else duration_hours * 3600
+        # At 60+0.5 (~2.5-3 min/game), a quick smoke-test cycle needs ~15 minutes (900s)
+        self.duration_seconds = 900 if quick_test else duration_hours * 3600
         self.state = load_state()
         if quick_test:
             self.state["total_seconds"] = self.duration_seconds
@@ -84,10 +85,11 @@ class AutonomousPipeline:
 
     def step_spsa_tuning(self):
         log(">> [Day 1 Focus] Executing SPSA search parameter tuning...")
-        iters = 2 if self.quick_test else 10
+        iters = 1 if self.quick_test else 5
+        games = 2 if self.quick_test else 6
         cmd = [
             sys.executable, os.path.join(TESTING_DIR, "tune_spsa.py"),
-            "--iters", str(iters), "--games", "8", "--tc", "3+0.05",
+            "--iters", str(iters), "--games", str(games), "--tc", "60+0.5",
             "--selfplay-games", "2" if self.quick_test else "25",
             "--epochs", "2" if self.quick_test else "5",
         ]
@@ -144,7 +146,8 @@ class AutonomousPipeline:
         candidate_options = f"WeightsFile={candidate_weights},{common_options}"
 
         # Quick mode is diagnostic only and must never promote a network.
-        games = 4 if self.quick_test else 200
+        # At 60+0.5 (~2.5-3 min/game), 40 games per SPRT cycle takes ~1.8 hours.
+        games = 2 if self.quick_test else 40
         cmd = [
             sys.executable, os.path.join(TESTING_DIR, "match_sprt.py"),
             "--engine1", os.path.join(REPO_DIR, "GiraffeGPU"),
@@ -152,7 +155,7 @@ class AutonomousPipeline:
             "--engine1-options", candidate_options,
             "--engine2-options", f"WeightsFile={os.path.join(REPO_DIR, 'eval.net')},{common_options}",
             "--games", str(games),
-            "--tc", "3+0.05",
+            "--tc", "60+0.5",
             "--sprt"
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_DIR)
@@ -329,7 +332,7 @@ def main():
     parser.add_argument("--daemon", action="store_true", help="Launch in background as a daemon process")
     parser.add_argument("--status", action="store_true", help="Check live status of the running autonomous session")
     parser.add_argument("--stop", action="store_true", help="Gracefully stop the running autonomous session")
-    parser.add_argument("--test-run", action="store_true", help="Run a fast 3-minute smoke test of the entire pipeline")
+    parser.add_argument("--test-run", action="store_true", help="Run a 15-minute smoke test of the pipeline at 60+0.5")
     parser.add_argument("--fresh", action="store_true", help="Archive saved state and start again from Day 1")
     parser.add_argument("--duration-hours", type=int, default=120, help="Total duration in hours (default: 120)")
 

@@ -159,4 +159,24 @@ struct Move {
 
 const Move MOVE_NONE = Move(0);
 
+struct MoveList {
+    Move moves[256];
+    int count = 0;
+
+    inline void clear() { count = 0; }
+    inline void push_back(Move m) { moves[count++] = m; }
+    inline void emplace_back(Square from, Square to, MoveType type = MOVE_NORMAL, PieceType promo = KNIGHT) {
+        moves[count++] = Move(from, to, type, promo);
+    }
+    inline size_t size() const { return static_cast<size_t>(count); }
+    inline bool empty() const { return count == 0; }
+    inline Move& operator[](size_t i) { return moves[i]; }
+    inline const Move& operator[](size_t i) const { return moves[i]; }
+    inline void resize(size_t n) { count = static_cast<int>(n); }
+    inline Move* begin() { return moves; }
+    inline Move* end() { return moves + count; }
+    inline const Move* begin() const { return moves; }
+    inline const Move* end() const { return moves + count; }
+};
+
 #endif // TYPES_H

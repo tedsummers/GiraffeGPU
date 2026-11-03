@@ -17,3 +17,5 @@ GiraffeGPU
 # Test run outputs
 testing/results/*
 !testing/results/.gitkeep
+__pycache__/
+*.pyc

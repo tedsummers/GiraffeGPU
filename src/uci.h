@@ -34,6 +34,7 @@ private:
     Board board_;
     std::thread search_thread_;
     std::string weights_path_ = "eval.net";
+    std::string syzygy_path_ = "/run/media/idiot/7c8982f6-9be0-4312-be37-be9200f3cead/syzygy";
     bool weights_loaded_ = false;
 };
 

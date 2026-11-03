@@ -171,6 +171,10 @@ static inline void forward_pass_cpu(
 }
 
 Value DeviceContext::evaluate_single(const Board& board) {
+    return evaluate_with_h2(board, nullptr);
+}
+
+Value DeviceContext::evaluate_with_h2(const Board& board, float* out_h2) {
     std::lock_guard<std::mutex> lock(mtx);
 
     Giraffe::extract_features(board, h_input_batch);
@@ -184,10 +188,40 @@ Value DeviceContext::evaluate_single(const Board& board) {
         d_hidden1_batch, d_hidden2_batch, h_output_batch
     );
 
+    if (out_h2) {
+        std::memcpy(out_h2, d_hidden2_batch, L2_DIM * sizeof(float));
+    }
+
     float raw_score = h_output_batch[0];
     float cp = raw_score * 1000.0f;
     Value val = static_cast<Value>(std::round(cp));
     return (board.side_to_move() == WHITE) ? val : -val;
+}
+
+void DeviceContext::evaluate_batch_raw(const Board* boards, int count, Value* out_scores) {
+    if (count <= 0) return;
+    std::lock_guard<std::mutex> lock(mtx);
+
+    for (int offset = 0; offset < count; offset += max_batch_size) {
+        int current_batch = std::min(max_batch_size, count - offset);
+        for (int b = 0; b < current_batch; ++b) {
+            Giraffe::extract_features(boards[offset + b], h_input_batch + b * IN_DIM);
+            forward_pass_cpu(
+                h_input_batch + b * IN_DIM,
+                g_neural_gpu.h_w1_, g_neural_gpu.h_b1_,
+                g_neural_gpu.h_w2_, g_neural_gpu.h_b2_,
+                g_neural_gpu.h_w3_, g_neural_gpu.h_b3_,
+                g_neural_gpu.h_w_pol_, g_neural_gpu.h_b_pol_,
+                d_hidden1_batch + b * L1_DIM,
+                d_hidden2_batch + b * L2_DIM,
+                h_output_batch + b * OUT_DIM
+            );
+            float raw_score = h_output_batch[b * OUT_DIM];
+            float cp = raw_score * 1000.0f;
+            Value val = static_cast<Value>(std::round(cp));
+            out_scores[offset + b] = (boards[offset + b].side_to_move() == WHITE) ? val : -val;
+        }
+    }
 }
 
 Value DeviceContext::evaluate_dual(const Board& board, float* out_policy_4096) {
@@ -355,6 +389,23 @@ void NeuralGPU::init_default_weights() {
     std::fill(h_w_pol_.begin(), h_w_pol_.end(), 0.0f);
     std::fill(h_b_pol_.begin(), h_b_pol_.end(), 0.0f);
 
+    std::mt19937 rng(0x618AFFE2u);
+    std::normal_distribution<float> dist_l1(0.0f, std::sqrt(2.0f / IN_DIM) * 0.25f);
+    std::normal_distribution<float> dist_l2(0.0f, std::sqrt(2.0f / L1_DIM) * 0.25f);
+
+    for (int n = 5; n < L1_DIM; ++n) {
+        h_b1_[n] = 0.01f;
+        for (int i = 0; i < IN_DIM; ++i) {
+            h_w1_[n * IN_DIM + i] = dist_l1(rng);
+        }
+    }
+    for (int n = 2; n < L2_DIM; ++n) {
+        h_b2_[n] = 0.01f;
+        for (int i = 5; i < L1_DIM; ++i) {
+            h_w2_[n * L1_DIM + i] = dist_l2(rng);
+        }
+    }
+
     h_w1_[0 * IN_DIM + 0] = 9.00f; // WQ
     h_w1_[0 * IN_DIM + 1] = 5.00f * 2.0f; // WR
     h_w1_[0 * IN_DIM + 2] = 3.30f * 2.0f; // WB
@@ -455,7 +506,7 @@ bool NeuralGPU::load_weights(const std::string& path) {
 
     char magic[8];
     is.read(magic, 8);
-    if (std::strncmp(magic, "GIRAFDUAL", 8) == 0) {
+    if (std::strncmp(magic, "GIRAFDUA", 8) == 0) {
         is.read(reinterpret_cast<char*>(h_w1_.data()), h_w1_.size() * sizeof(float));
         is.read(reinterpret_cast<char*>(h_b1_.data()), h_b1_.size() * sizeof(float));
         is.read(reinterpret_cast<char*>(h_w2_.data()), h_w2_.size() * sizeof(float));
@@ -501,6 +552,17 @@ bool NeuralGPU::load_weights(const std::string& path) {
         }
     }
 
+    bool dead_hidden = true;
+    for (int n = 5; n < L1_DIM; ++n) {
+        if (std::abs(h_w1_[n * IN_DIM]) > 1e-7f) {
+            dead_hidden = false;
+            break;
+        }
+    }
+    if (dead_hidden) {
+        init_default_weights();
+    }
+
     for (auto& ctx : contexts_) {
         ctx->copy_weights(h_w1_, h_b1_, h_w2_, h_b2_, h_w3_, h_b3_, h_w_pol_, h_b_pol_);
     }
@@ -510,7 +572,7 @@ bool NeuralGPU::load_weights(const std::string& path) {
 bool NeuralGPU::save_weights(const std::string& path) {
     std::ofstream os(path, std::ios::binary);
     if (!os) return false;
-    os.write("GIRAFDUAL", 8);
+    os.write("GIRAFDUA", 8);
     os.write(reinterpret_cast<const char*>(h_w1_.data()), h_w1_.size() * sizeof(float));
     os.write(reinterpret_cast<const char*>(h_b1_.data()), h_b1_.size() * sizeof(float));
     os.write(reinterpret_cast<const char*>(h_w2_.data()), h_w2_.size() * sizeof(float));
@@ -522,41 +584,83 @@ bool NeuralGPU::save_weights(const std::string& path) {
     return true;
 }
 
-Value NeuralGPU::evaluate(const Board& board, int worker_id) {
+Value NeuralGPU::evaluate_fast_cpu(const Board& board, float* out_h2) const {
+    alignas(32) float in[IN_DIM];
+    alignas(32) float h1[L1_DIM];
+    alignas(32) float h2_local[L2_DIM];
+    float* h2 = out_h2 ? out_h2 : h2_local;
+    float out = 0.0f;
+
+    Giraffe::extract_features(board, in);
+    forward_pass_cpu(in, h_w1_, h_b1_, h_w2_, h_b2_, h_w3_, h_b3_, h_w_pol_, h_b_pol_, h1, h2, &out, nullptr);
+
+    Value val = static_cast<Value>(std::round(out * 1000.0f));
+    return (board.side_to_move() == WHITE) ? val : -val;
+}
+
+float NeuralGPU::score_move_policy_fast_cpu(int pol_idx, const float* h2) const {
+    if (!h2 || pol_idx < 0 || pol_idx >= POLICY_DIM) return 0.0f;
+    const float* row = h_w_pol_.data() + pol_idx * L2_DIM;
+    float sum = h_b_pol_[pol_idx];
+    for (int i = 0; i < L2_DIM; ++i) {
+        sum += h2[i] * row[i];
+    }
+    return sum;
+}
+
+Value NeuralGPU::evaluate_dual_fast_cpu(const Board& board, float* out_policy_4096) const {
+    alignas(32) float in[IN_DIM];
+    alignas(32) float h1[L1_DIM];
+    alignas(32) float h2[L2_DIM];
+    float out = 0.0f;
+
+    Giraffe::extract_features(board, in);
+    forward_pass_cpu(in, h_w1_, h_b1_, h_w2_, h_b2_, h_w3_, h_b3_, h_w_pol_, h_b_pol_, h1, h2, &out, out_policy_4096);
+
+    Value val = static_cast<Value>(std::round(out * 1000.0f));
+    return (board.side_to_move() == WHITE) ? val : -val;
+}
+
+Value NeuralGPU::evaluate(const Board& board, int /*worker_id*/) {
     if (!initialized_ || contexts_.empty()) {
         init(device_id_, max_batch_size_);
     }
 
-    size_t idx = 0;
-    if (worker_id >= 0) {
-        idx = static_cast<size_t>(worker_id) % contexts_.size();
-    } else {
-        idx = (round_robin_counter_.fetch_add(1)) % contexts_.size();
-    }
-
+    size_t idx = (round_robin_counter_.fetch_add(1, std::memory_order_relaxed)) % contexts_.size();
     return contexts_[idx]->evaluate_single(board);
 }
 
-Value NeuralGPU::evaluate_dual(const Board& board, float* out_policy_4096, int worker_id) {
+Value NeuralGPU::evaluate_with_h2(const Board& board, float* out_h2, int /*worker_id*/) {
     if (!initialized_ || contexts_.empty()) {
         init(device_id_, max_batch_size_);
     }
 
-    size_t idx = 0;
-    if (contexts_.size() > 1) {
-        if (worker_id >= 0) {
-            idx = static_cast<size_t>(worker_id) % contexts_.size();
-        } else {
-            idx = (round_robin_counter_.fetch_add(1)) % contexts_.size();
-        }
+    size_t idx = (round_robin_counter_.fetch_add(1, std::memory_order_relaxed)) % contexts_.size();
+    return contexts_[idx]->evaluate_with_h2(board, out_h2);
+}
+
+void NeuralGPU::evaluate_batch_raw(const Board* boards, int count, Value* out_scores, int /*worker_id*/) {
+    if (count <= 0) return;
+    if (!initialized_ || contexts_.empty()) {
+        init(device_id_, std::max(count, max_batch_size_));
     }
 
+    size_t idx = (round_robin_counter_.fetch_add(1, std::memory_order_relaxed)) % contexts_.size();
+    contexts_[idx]->evaluate_batch_raw(boards, count, out_scores);
+}
+
+Value NeuralGPU::evaluate_dual(const Board& board, float* out_policy_4096, int /*worker_id*/) {
+    if (!initialized_ || contexts_.empty()) {
+        init(device_id_, max_batch_size_);
+    }
+
+    size_t idx = (round_robin_counter_.fetch_add(1, std::memory_order_relaxed)) % contexts_.size();
     return contexts_[idx]->evaluate_dual(board, out_policy_4096);
 }
 
-void NeuralGPU::get_policy(const Board& board, std::vector<float>& out_logits, int worker_id) {
+Value NeuralGPU::get_policy(const Board& board, std::vector<float>& out_logits, int worker_id) {
     out_logits.resize(POLICY_DIM);
-    evaluate_dual(board, out_logits.data(), worker_id);
+    return evaluate_dual(board, out_logits.data(), worker_id);
 }
 
 void NeuralGPU::get_move_probabilities(const Board& board, const std::vector<Move>& moves, std::vector<float>& out_probs, int worker_id) {

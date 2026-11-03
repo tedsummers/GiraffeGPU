@@ -25,12 +25,14 @@ struct SearchLimits {
     int movestogo = 0;
     bool infinite = false;
     bool ponder = false;
+    std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now();
 };
 
 // Search tables for move ordering: history, countermove, and continuation history
 struct SearchWorker {
     int id;
     int seldepth;
+    uint32_t local_nodes;
     Move killer_moves[128][2];
     
     // Main history: piece -> to_square
@@ -43,21 +45,28 @@ struct SearchWorker {
     // int16_t is sufficient for the gravity range and keeps worker state small.
     int16_t conthist[PIECE_NB][64][PIECE_NB][64];
 
-    // Move stack for continuation history lookups
+    // Move stack and static eval stack for continuation history and improving heuristics
     Move move_stack[128];
+    Value eval_stack[128];
 
     Move pv_table[128][128];
     int pv_length[128];
 
-    void clear() {
+    void clear_search() {
         seldepth = 0;
+        local_nodes = 0;
         for (int i = 0; i < 128; i++) {
             killer_moves[i][0] = Move();
             killer_moves[i][1] = Move();
             move_stack[i] = Move();
+            eval_stack[i] = VALUE_NONE;
             pv_length[i] = 0;
             for (int j = 0; j < 128; j++) pv_table[i][j] = Move();
         }
+    }
+
+    void clear() {
+        clear_search();
         std::memset(history, 0, sizeof(history));
         for (int p = 0; p < PIECE_NB; p++) {
             for (int s = 0; s < 64; s++) {
@@ -75,6 +84,7 @@ public:
 
     void set_threads(int num_threads);
     int num_threads() const { return num_threads_; }
+    void clear_histories();
 
     void set_aspiration_window(int value) { aspiration_window_ = std::max(1, std::min(value, 1000)); }
     void set_null_move_reduction(int value) { null_move_reduction_ = std::max(1, std::min(value, 8)); }
@@ -93,6 +103,7 @@ public:
 
     bool is_searching() const { return searching_.load(); }
     uint64_t nodes_searched() const { return nodes_.load(); }
+    uint64_t tb_hits() const { return tb_hits_.load(); }
 
     void set_syzygy_path(const std::string& path) {
         Syzygy::init(path);
@@ -108,15 +119,18 @@ private:
     Value pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha, Value beta, bool cut_node);
     Value qsearch(Board& board, SearchWorker& w, int ply, Value alpha, Value beta, int qply = 0);
 
-    void order_moves(const Board& board, const SearchWorker& w, std::vector<Move>& moves, Move tt_move, int ply, const float* policy = nullptr);
-    void update_quiet_history(SearchWorker& w, const Board& board, Move best_quiet, const std::vector<Move>& quiet_moves, int depth, int ply);
+    void order_moves(const Board& board, const SearchWorker& w, MoveList& moves, Move tt_move, int ply, const float* policy_h2 = nullptr);
+    void update_quiet_history(SearchWorker& w, const Board& board, Move best_quiet, const MoveList& quiet_moves, int depth, int ply);
 
-    bool check_time();
+    bool check_time(bool force_clock_check = false);
+    int64_t elapsed_ms() const;
 
     std::atomic<bool> stop_flag_;
     std::atomic<bool> searching_;
     std::atomic<bool> pondering_;
     std::atomic<uint64_t> nodes_;
+    std::atomic<uint64_t> tb_hits_;
+    std::atomic<int64_t> start_time_ns_;
 
     bool ponder_enabled_;
     bool policy_net_enabled_;
@@ -128,12 +142,14 @@ private:
     int probcut_margin_;
     int move_overhead_ms_;
     SearchLimits limits_;
-    std::chrono::steady_clock::time_point start_time_;
     int64_t target_time_ms_;
     int64_t hard_limit_ms_;
 
     std::vector<std::thread> helper_threads_;
+    std::vector<std::unique_ptr<SearchWorker>> workers_;
     SearchWorker main_worker_;
+    MoveList root_tb_moves_;
+    int root_piece_count_ = 32;
 };
 
 extern Search g_search;

@@ -60,8 +60,15 @@ public:
 
     bool is_checkmate() const;
     bool is_stalemate() const;
-    bool is_draw() const;
-    bool is_repetition() const;
+    bool is_draw(int ply = 0) const;
+    bool is_repetition(int ply = 0) const;
+
+    bool has_non_pawn_material(Color c) const {
+        return (pieces_bb_[make_piece(c, KNIGHT)] |
+                pieces_bb_[make_piece(c, BISHOP)] |
+                pieces_bb_[make_piece(c, ROOK)]   |
+                pieces_bb_[make_piece(c, QUEEN)]) != 0;
+    }
 
     bool make_move(Move m);
     void unmake_move(Move m);
@@ -69,6 +76,10 @@ public:
     void make_null_move();
     void unmake_null_move();
 
+    void generate_pseudo_legal_moves(MoveList& moves) const;
+    void generate_pseudo_captures(MoveList& moves) const;
+    void generate_legal_moves(MoveList& moves) const;
+    void generate_captures(MoveList& moves) const;
     void generate_legal_moves(std::vector<Move>& moves) const;
     void generate_captures(std::vector<Move>& moves) const;
 

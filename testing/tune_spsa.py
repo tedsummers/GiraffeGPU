@@ -26,7 +26,7 @@ DEFAULT_PARAMS = {
 }
 
 class SPSATuner:
-    def __init__(self, engine_path, params=None, tc="3+0.05", games_per_iter=4):
+    def __init__(self, engine_path, params=None, tc="60+0.5", games_per_iter=4):
         self.engine_path = os.path.abspath(engine_path)
         self.params = params or DEFAULT_PARAMS
         self.tc = tc
@@ -108,13 +108,23 @@ class SPSATuner:
         for name, p in self.params.items():
             d = 1 if random.random() < 0.5 else -1
             delta[name] = d
-            c_k = p["c"] / ((k + 1) ** 0.101)
-            
+            c_k = max(0.5, p["c"] / ((k + 1) ** 0.101))
+
             val_plus = p["val"] + c_k * d
             val_minus = p["val"] - c_k * d
-            
-            theta_plus[name] = max(p["min"], min(p["max"], round(val_plus)))
-            theta_minus[name] = max(p["min"], min(p["max"], round(val_minus)))
+
+            p_int = max(p["min"], min(p["max"], round(val_plus)))
+            m_int = max(p["min"], min(p["max"], round(val_minus)))
+            if p_int == m_int:
+                if d > 0:
+                    if p_int < p["max"]: p_int += 1
+                    elif m_int > p["min"]: m_int -= 1
+                else:
+                    if m_int < p["max"]: m_int += 1
+                    elif p_int > p["min"]: p_int -= 1
+
+            theta_plus[name] = p_int
+            theta_minus[name] = m_int
 
         return delta, theta_plus, theta_minus
 
@@ -203,7 +213,7 @@ def main():
     parser = argparse.ArgumentParser(description="GiraffeGPU SPSA Parameter Tuner")
     parser.add_argument("--engine", default="./GiraffeGPU", help="Path to engine binary")
     parser.add_argument("--iters", type=int, default=5, help="Number of SPSA iterations")
-    parser.add_argument("--tc", default="3+0.05", help="Time control for tuning matches")
+    parser.add_argument("--tc", default="60+0.5", help="Time control for tuning matches")
     parser.add_argument("--games", type=int, default=8, help="Games per SPSA perturbation match")
     parser.add_argument("--selfplay-games", type=int, default=25, help="Games to generate if no dataset exists")
     parser.add_argument("--selfplay-movetime", type=int, default=80, help="Self-play movetime in milliseconds")

@@ -342,13 +342,16 @@ bool Board::make_move(Move m) {
         square_piece_[r_to] = r_piece;
     }
 
-    // En passant square update for 2-step pawn push
+    // En passant square update for 2-step pawn push (only hash EP when an enemy pawn can capture)
     if (piece_type(moving) == PAWN) {
         int r_from = square_rank(from);
         int r_to = square_rank(to);
         if (std::abs(r_to - r_from) == 2) {
-            ep_square_ = make_square(square_file(from), static_cast<Rank>((r_from + r_to) / 2));
-            key_ ^= Zobrist::EP[ep_square_];
+            Square candidate_ep = make_square(square_file(from), static_cast<Rank>((r_from + r_to) / 2));
+            if (Bitboards::PAWN_ATTACKS[us][candidate_ep] & pieces_bb_[make_piece(them, PAWN)]) {
+                ep_square_ = candidate_ep;
+                key_ ^= Zobrist::EP[ep_square_];
+            }
         }
     }
 
@@ -468,7 +471,7 @@ void Board::unmake_null_move() {
     history_.pop_back();
 }
 
-void Board::generate_legal_moves(std::vector<Move>& moves) const {
+void Board::generate_pseudo_legal_moves(MoveList& moves) const {
     moves.clear();
     Color us = stm_;
     Color them = ~us;
@@ -608,8 +611,104 @@ void Board::generate_legal_moves(std::vector<Move>& moves) const {
             }
         }
     }
+}
 
-    // Filter legal moves
+void Board::generate_pseudo_captures(MoveList& moves) const {
+    moves.clear();
+    Color us = stm_;
+    Color them = ~us;
+    Bitboard occ = occupied_bb();
+    Bitboard enemies = color_bb_[them];
+    Bitboard empty = ~occ;
+
+    // Pawns (captures + promotions + en passant)
+    Bitboard pawns = pieces_bb_[make_piece(us, PAWN)];
+    Rank promo_rank = (us == WHITE) ? RANK_7 : RANK_2;
+    int fwd = (us == WHITE) ? 8 : -8;
+
+    while (pawns) {
+        Square sq = pop_lsb(pawns);
+        Rank r = square_rank(sq);
+        Square one_step = static_cast<Square>(sq + fwd);
+
+        if (r == promo_rank && (empty & square_bb(one_step))) {
+            moves.emplace_back(sq, one_step, MOVE_PROMOTION, QUEEN);
+            moves.emplace_back(sq, one_step, MOVE_PROMOTION, ROOK);
+            moves.emplace_back(sq, one_step, MOVE_PROMOTION, BISHOP);
+            moves.emplace_back(sq, one_step, MOVE_PROMOTION, KNIGHT);
+        }
+
+        Bitboard att = Bitboards::PAWN_ATTACKS[us][sq];
+        Bitboard targets = att & enemies;
+        while (targets) {
+            Square t = pop_lsb(targets);
+            if (r == promo_rank) {
+                moves.emplace_back(sq, t, MOVE_PROMOTION, QUEEN);
+                moves.emplace_back(sq, t, MOVE_PROMOTION, ROOK);
+                moves.emplace_back(sq, t, MOVE_PROMOTION, BISHOP);
+                moves.emplace_back(sq, t, MOVE_PROMOTION, KNIGHT);
+            } else {
+                moves.emplace_back(sq, t, MOVE_NORMAL);
+            }
+        }
+
+        if (ep_square_ != SQ_NONE && (att & square_bb(ep_square_))) {
+            moves.emplace_back(sq, ep_square_, MOVE_EN_PASSANT);
+        }
+    }
+
+    // Knights
+    Bitboard knights = pieces_bb_[make_piece(us, KNIGHT)];
+    while (knights) {
+        Square sq = pop_lsb(knights);
+        Bitboard att = Bitboards::KNIGHT_ATTACKS[sq] & enemies;
+        while (att) {
+            moves.emplace_back(sq, pop_lsb(att), MOVE_NORMAL);
+        }
+    }
+
+    // Bishops
+    Bitboard bishops = pieces_bb_[make_piece(us, BISHOP)];
+    while (bishops) {
+        Square sq = pop_lsb(bishops);
+        Bitboard att = Bitboards::bishop_attacks(sq, occ) & enemies;
+        while (att) {
+            moves.emplace_back(sq, pop_lsb(att), MOVE_NORMAL);
+        }
+    }
+
+    // Rooks
+    Bitboard rooks = pieces_bb_[make_piece(us, ROOK)];
+    while (rooks) {
+        Square sq = pop_lsb(rooks);
+        Bitboard att = Bitboards::rook_attacks(sq, occ) & enemies;
+        while (att) {
+            moves.emplace_back(sq, pop_lsb(att), MOVE_NORMAL);
+        }
+    }
+
+    // Queens
+    Bitboard queens = pieces_bb_[make_piece(us, QUEEN)];
+    while (queens) {
+        Square sq = pop_lsb(queens);
+        Bitboard att = Bitboards::queen_attacks(sq, occ) & enemies;
+        while (att) {
+            moves.emplace_back(sq, pop_lsb(att), MOVE_NORMAL);
+        }
+    }
+
+    // King
+    Square ksq = king_square(us);
+    if (ksq != SQ_NONE) {
+        Bitboard att = Bitboards::KING_ATTACKS[ksq] & enemies;
+        while (att) {
+            moves.emplace_back(ksq, pop_lsb(att), MOVE_NORMAL);
+        }
+    }
+}
+
+void Board::generate_legal_moves(MoveList& moves) const {
+    generate_pseudo_legal_moves(moves);
     Board* non_const_this = const_cast<Board*>(this);
     size_t legal_count = 0;
     for (size_t i = 0; i < moves.size(); ++i) {
@@ -621,19 +720,33 @@ void Board::generate_legal_moves(std::vector<Move>& moves) const {
     moves.resize(legal_count);
 }
 
-void Board::generate_captures(std::vector<Move>& moves) const {
-    std::vector<Move> all_moves;
-    generate_legal_moves(all_moves);
-    moves.clear();
-    for (const auto& m : all_moves) {
-        if (square_piece_[m.to_sq()] != NO_PIECE || m.is_en_passant() || m.is_promotion()) {
-            moves.push_back(m);
+void Board::generate_captures(MoveList& moves) const {
+    generate_pseudo_captures(moves);
+    Board* non_const_this = const_cast<Board*>(this);
+    size_t legal_count = 0;
+    for (size_t i = 0; i < moves.size(); ++i) {
+        if (non_const_this->make_move(moves[i])) {
+            non_const_this->unmake_move(moves[i]);
+            moves[legal_count++] = moves[i];
         }
     }
+    moves.resize(legal_count);
+}
+
+void Board::generate_legal_moves(std::vector<Move>& moves) const {
+    MoveList ml;
+    generate_legal_moves(ml);
+    moves.assign(ml.begin(), ml.end());
+}
+
+void Board::generate_captures(std::vector<Move>& moves) const {
+    MoveList ml;
+    generate_captures(ml);
+    moves.assign(ml.begin(), ml.end());
 }
 
 bool Board::is_legal_move(Move m) const {
-    std::vector<Move> moves;
+    MoveList moves;
     generate_legal_moves(moves);
     for (const auto& legal_m : moves) {
         if (legal_m == m) return true;
@@ -657,7 +770,7 @@ Move Board::parse_move_uci(const std::string& uci) const {
         }
     }
 
-    std::vector<Move> moves;
+    MoveList moves;
     generate_legal_moves(moves);
     for (const auto& m : moves) {
         if (m.from_sq() == from && m.to_sq() == to) {
@@ -673,24 +786,25 @@ Move Board::parse_move_uci(const std::string& uci) const {
 
 bool Board::is_checkmate() const {
     if (!in_check()) return false;
-    std::vector<Move> moves;
+    MoveList moves;
     generate_legal_moves(moves);
     return moves.empty();
 }
 
 bool Board::is_stalemate() const {
     if (in_check()) return false;
-    std::vector<Move> moves;
+    MoveList moves;
     generate_legal_moves(moves);
     return moves.empty();
 }
 
-bool Board::is_draw() const {
+bool Board::is_draw(int ply) const {
     if (halfmove_clock_ >= 100) return true;
-    if (is_repetition()) return true;
+    if (is_repetition(ply)) return true;
     // Insufficient material
-    if (popcount(occupied_bb()) == 2) return true; // KK
-    if (popcount(occupied_bb()) == 3) {
+    int total_pieces = popcount(occupied_bb());
+    if (total_pieces == 2) return true; // KK
+    if (total_pieces == 3) {
         if (pieces_bb_[W_KNIGHT] || pieces_bb_[B_KNIGHT] || pieces_bb_[W_BISHOP] || pieces_bb_[B_BISHOP]) {
             return true;
         }
@@ -698,12 +812,17 @@ bool Board::is_draw() const {
     return false;
 }
 
-bool Board::is_repetition() const {
+bool Board::is_repetition(int ply) const {
     int count = 0;
-    for (int i = static_cast<int>(history_.size()) - 2; i >= 0; i -= 2) {
+    int hist_size = static_cast<int>(history_.size());
+    int min_idx = std::max(0, hist_size - halfmove_clock_);
+    for (int i = hist_size - 2; i >= min_idx; i -= 2) {
         if (history_[i].key == key_) {
+            if (ply > 0 && i >= hist_size - ply) {
+                return true; // 2-fold repetition within the current search tree
+            }
             count++;
-            if (count >= 2) return true; // 3-fold repetition
+            if (count >= 2) return true; // 3-fold repetition across game history
         }
     }
     return false;
@@ -720,7 +839,22 @@ bool Board::gives_check(Move m) const {
     Piece moving = square_piece_[from];
     PieceType pt = piece_type(moving);
 
-    Bitboard occ = (occupied_bb() ^ square_bb(from)) | square_bb(to);
+    Bitboard occ = (occupied_bb() & ~square_bb(from)) | square_bb(to);
+    if (m.is_en_passant()) {
+        Square cap_sq = make_square(square_file(to), square_rank(from));
+        occ &= ~square_bb(cap_sq);
+    }
+
+    if (m.is_castling()) {
+        Square r_from, r_to;
+        if (to == SQ_G1) { r_from = SQ_H1; r_to = SQ_F1; }
+        else if (to == SQ_C1) { r_from = SQ_A1; r_to = SQ_D1; }
+        else if (to == SQ_G8) { r_from = SQ_H8; r_to = SQ_F8; }
+        else { r_from = SQ_A8; r_to = SQ_D8; }
+        occ = (occ & ~square_bb(r_from)) | square_bb(r_to);
+        if (Bitboards::rook_attacks(r_to, occ) & square_bb(ksq)) return true;
+        return false;
+    }
 
     // Direct check from moving piece
     Bitboard attacks = 0;
@@ -736,13 +870,13 @@ bool Board::gives_check(Move m) const {
     if (attacks & square_bb(ksq)) return true;
 
     // Discovered check
-    Bitboard diag_slider = pieces_bb_[make_piece(us, BISHOP)] | pieces_bb_[make_piece(us, QUEEN)];
-    if ((diag_slider & ~square_bb(from)) && (Bitboards::bishop_attacks(ksq, occ) & diag_slider & ~square_bb(from))) {
+    Bitboard diag_slider = (pieces_bb_[make_piece(us, BISHOP)] | pieces_bb_[make_piece(us, QUEEN)]) & ~square_bb(from);
+    if (diag_slider && (Bitboards::bishop_attacks(ksq, occ) & diag_slider)) {
         return true;
     }
 
-    Bitboard orth_slider = pieces_bb_[make_piece(us, ROOK)] | pieces_bb_[make_piece(us, QUEEN)];
-    if ((orth_slider & ~square_bb(from)) && (Bitboards::rook_attacks(ksq, occ) & orth_slider & ~square_bb(from))) {
+    Bitboard orth_slider = (pieces_bb_[make_piece(us, ROOK)] | pieces_bb_[make_piece(us, QUEEN)]) & ~square_bb(from);
+    if (orth_slider && (Bitboards::rook_attacks(ksq, occ) & orth_slider)) {
         return true;
     }
 
