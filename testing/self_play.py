@@ -12,6 +12,8 @@ import random
 import subprocess
 import json
 import argparse
+import threading
+import queue
 from datetime import datetime
 
 try:
@@ -243,6 +245,7 @@ def main():
     parser.add_argument("--random-plies", type=int, default=6, help="Legal random opening plies (default: 6)")
     parser.add_argument("--max-moves", type=int, default=100, help="Maximum full moves per game")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible openings")
+    parser.add_argument("--workers", type=int, default=2, help="Parallel GPU self-play workers (default: 2 for Dual-GPU)")
 
     args = parser.parse_args()
     if args.seed is not None:
@@ -258,8 +261,10 @@ def main():
             name, value = item.split("=", 1)
             engine_options[name.strip()] = value.strip()
 
+    num_workers = max(1, min(args.workers, args.games))
+
     print(f"\n=======================================================")
-    print(f"Starting Self-Play Generation: {args.games} games")
+    print(f"Starting Self-Play Generation: {args.games} games ({num_workers} GPU worker(s))")
     print(f"Engine:    {args.engine}")
     print(f"Movetime:  {args.movetime} ms per move")
     print(f"Output:    {output_path}")
@@ -268,35 +273,86 @@ def main():
     total_positions = 0
     t0 = time.time()
 
-    engine = UCIEngineInstance(args.engine, engine_options=engine_options)
-    try:
+    if num_workers == 1:
+        engine = UCIEngineInstance(args.engine, engine_options=engine_options)
+        try:
+            with open(output_path, "a") as f_out:
+                for g in range(1, args.games + 1):
+                    g_start = time.time()
+                    game_data = play_selfplay_game(engine, movetime=args.movetime,
+                                                   random_plies=args.random_plies,
+                                                   max_moves=args.max_moves,
+                                                   engine_options=engine_options)
+                    g_time = time.time() - g_start
+
+                    for pos in game_data["positions"]:
+                        record = {
+                            "game_id": g,
+                            "ply": pos["ply"],
+                            "fen": pos["fen"],
+                            "side": pos["side"],
+                            "move": pos["move"],
+                            "eval_cp": pos["eval_cp"],
+                            "depth": pos["depth"],
+                            "target_outcome": pos["target_outcome"],
+                            "game_result": game_data["result"]
+                        }
+                        f_out.write(json.dumps(record) + "\n")
+                        total_positions += 1
+
+                    print(f"Game {g:>3}/{args.games}: {game_data['result']:<7} ({game_data['plies']} plies, {len(game_data['positions'])} positions, {g_time:.1f}s)")
+        finally:
+            engine.close()
+    else:
+        game_queue = queue.Queue()
+        for g in range(1, args.games + 1):
+            game_queue.put(g)
+
+        write_lock = threading.Lock()
         with open(output_path, "a") as f_out:
-            for g in range(1, args.games + 1):
-                g_start = time.time()
-                game_data = play_selfplay_game(engine, movetime=args.movetime,
-                                               random_plies=args.random_plies,
-                                               max_moves=args.max_moves,
-                                               engine_options=engine_options)
-                g_time = time.time() - g_start
+            def worker_fn(worker_idx):
+                nonlocal total_positions
+                worker_opts = dict(engine_options)
+                if "Threads" not in worker_opts:
+                    worker_opts["Threads"] = "2"
+                engine = UCIEngineInstance(args.engine, device_id=worker_idx, engine_options=worker_opts)
+                try:
+                    while True:
+                        try:
+                            g = game_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        g_start = time.time()
+                        game_data = play_selfplay_game(engine, movetime=args.movetime,
+                                                       random_plies=args.random_plies,
+                                                       max_moves=args.max_moves,
+                                                       engine_options=worker_opts)
+                        g_time = time.time() - g_start
+                        with write_lock:
+                            for pos in game_data["positions"]:
+                                record = {
+                                    "game_id": g,
+                                    "ply": pos["ply"],
+                                    "fen": pos["fen"],
+                                    "side": pos["side"],
+                                    "move": pos["move"],
+                                    "eval_cp": pos["eval_cp"],
+                                    "depth": pos["depth"],
+                                    "target_outcome": pos["target_outcome"],
+                                    "game_result": game_data["result"]
+                                }
+                                f_out.write(json.dumps(record) + "\n")
+                                total_positions += 1
+                            f_out.flush()
+                            print(f"[GPU {worker_idx}] Game {g:>3}/{args.games}: {game_data['result']:<7} ({game_data['plies']} plies, {len(game_data['positions'])} positions, {g_time:.1f}s)")
+                finally:
+                    engine.close()
 
-                for pos in game_data["positions"]:
-                    record = {
-                        "game_id": g,
-                        "ply": pos["ply"],
-                        "fen": pos["fen"],
-                        "side": pos["side"],
-                        "move": pos["move"],
-                        "eval_cp": pos["eval_cp"],
-                        "depth": pos["depth"],
-                        "target_outcome": pos["target_outcome"],
-                        "game_result": game_data["result"]
-                    }
-                    f_out.write(json.dumps(record) + "\n")
-                    total_positions += 1
-
-                print(f"Game {g:>3}/{args.games}: {game_data['result']:<7} ({game_data['plies']} plies, {len(game_data['positions'])} positions, {g_time:.1f}s)")
-    finally:
-        engine.close()
+            threads = [threading.Thread(target=worker_fn, args=(w,)) for w in range(num_workers)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
 
     total_elapsed = time.time() - t0
     print("\n" + "=" * 55)

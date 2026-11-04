@@ -12,7 +12,8 @@ import math
 import json
 import random
 import argparse
-import random
+import subprocess
+import tempfile
 
 try:
     import numpy as np
@@ -288,8 +289,9 @@ def save_weights(path, w1, b1, w2, b2, w3, b3, w_pol, b_pol):
         f.write(struct.pack(f"{len(b_pol)}f", *b_pol))
 
 def train_on_dataset(data_path, in_weights_path, out_weights_path, epochs=3, lr=0.00025,
-                     policy_lr=0.0, max_output_delta=0.02, seed=1337,
-                     outcome_weight=0.7, eval_scale=400.0, holdout=0.2, max_samples_limit=50000):
+                     policy_lr=0.001, max_output_delta=0.02, seed=1337,
+                     outcome_weight=0.7, eval_scale=400.0, holdout=0.2, max_samples_limit=50000,
+                     use_gpu=True):
     w1, b1, w2, b2, w3, b3, w_pol, b_pol = load_weights(in_weights_path)
     base_policy_bias = list(b_pol)
 
@@ -332,17 +334,44 @@ def train_on_dataset(data_path, in_weights_path, out_weights_path, epochs=3, lr=
         return
 
     print(f"Loaded {len(samples)} training samples from {data_path}")
-    if np is None or chess is None:
-        raise RuntimeError("numpy and python-chess are required for feature-aware training")
-    print(f"Training feature-aware value and bounded policy heads for {epochs} epochs with learning rate {lr}...")
-
-    # Keep training bounded and memory-safe. The full dataset can be millions
-    # of positions; feature batches are materialised one batch at a time.
     random.seed(seed)
-    np.random.seed(seed)
     random.shuffle(samples)
     max_samples = min(len(samples), max_samples_limit)
     samples = samples[:max_samples]
+
+    # Fast native CUDA GPU training path (uses C++ Giraffe::extract_features + CUDA AdamW across all layers)
+    repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    engine_bin = os.path.join(repo_dir, "GiraffeGPU")
+    if use_gpu and os.path.exists(engine_bin) and os.access(engine_bin, os.X_OK):
+        with tempfile.NamedTemporaryFile("w", suffix=".tsv", delete=False) as tf_tsv, \
+             tempfile.NamedTemporaryFile("wb", suffix=".net", delete=False) as tf_in:
+            tsv_path = tf_tsv.name
+            tmp_in_net = tf_in.name
+            for fen, target_val, pol_idx in samples:
+                p_idx = pol_idx if (pol_idx is not None and 0 <= pol_idx < POLICY_DIM) else -1
+                pol_w = 1.0 if p_idx >= 0 else 0.0
+                tf_tsv.write(f"{fen}\t{target_val:.6f}\t{p_idx}\t{pol_w:.4f}\n")
+        save_weights(tmp_in_net, w1, b1, w2, b2, w3, b3, w_pol, b_pol)
+        try:
+            cmd = [
+                engine_bin, "train",
+                tsv_path, tmp_in_net, out_weights_path,
+                str(epochs), str(lr), str(policy_lr), "0.0002", str(max_output_delta)
+            ]
+            print(f"Executing native CUDA full-network training on GPU ({len(samples)} samples, {epochs} epochs)...")
+            res = subprocess.run(cmd, check=False)
+            if res.returncode == 0 and os.path.exists(out_weights_path):
+                return
+            print("Native CUDA training returned non-zero status; falling back to NumPy trainer.")
+        finally:
+            for p in (tsv_path, tmp_in_net):
+                if os.path.exists(p):
+                    try: os.remove(p)
+                    except OSError: pass
+
+    if np is None or chess is None:
+        raise RuntimeError("numpy and python-chess are required for feature-aware training")
+    print(f"Training feature-aware value and bounded policy heads for {epochs} epochs with learning rate {lr}...")
     import multiprocessing as mp
     num_workers = max(1, min(8, os.cpu_count() or 1))
     with mp.Pool(processes=num_workers) as pool:
@@ -486,10 +515,12 @@ def main():
                         help="Centipawn scale for normalized search targets")
     parser.add_argument("--holdout", type=float, default=0.2,
                         help="Fraction reserved for validation")
-    parser.add_argument("--policy-lr", type=float, default=0.0,
-                        help="Global policy-bias learning rate; 0 disables unsafe context-free updates")
+    parser.add_argument("--policy-lr", type=float, default=0.001,
+                        help="Context-aware policy head learning rate")
     parser.add_argument("--max-samples", type=int, default=50000,
                         help="Maximum positions to sample per training cycle")
+    parser.add_argument("--no-gpu", action="store_true",
+                        help="Force CPU/NumPy training instead of native CUDA training")
 
     args = parser.parse_args()
 
@@ -499,7 +530,8 @@ def main():
                      outcome_weight=max(0.0, min(1.0, args.outcome_weight)),
                      eval_scale=max(1.0, args.eval_scale),
                      holdout=max(0.05, min(0.5, args.holdout)),
-                     max_samples_limit=max(1000, args.max_samples))
+                     max_samples_limit=max(1000, args.max_samples),
+                     use_gpu=not args.no_gpu)
 
 if __name__ == "__main__":
     main()

@@ -268,7 +268,7 @@ Value Search::qsearch(Board& board, SearchWorker& w, int ply, Value alpha, Value
     if (!in_check) {
         if (tt_hit && tt_entry.eval != static_cast<int16_t>(VALUE_NONE)) {
             stand_pat = tt_entry.eval;
-        } else if (qply == 0 && w.eval_stack[ply] != VALUE_NONE) {
+        } else if (w.eval_stack[ply] != VALUE_NONE) {
             stand_pat = w.eval_stack[ply];
         } else {
             stand_pat = Neural::g_neural_gpu.evaluate(board, w.id);
@@ -295,8 +295,41 @@ Value Search::qsearch(Board& board, SearchWorker& w, int ply, Value alpha, Value
 
     order_moves(board, w, moves, tt_move, ply);
 
+    Value q_child_evals[256];
+    for (size_t k = 0; k < moves.size(); ++k) q_child_evals[k] = VALUE_NONE;
+    bool q_children_batched = false;
+
     int legal_moves = 0;
     for (size_t i = 0; i < moves.size(); ++i) {
+        // After the first legal capture fails to cut off, batch-evaluate all remaining legal capture children on the GPU!
+        if (legal_moves == 1 && !q_children_batched && i + 1 < moves.size()) {
+            if (check_time(true)) return VALUE_ZERO;
+            q_children_batched = true;
+            Board batch_boards[64];
+            size_t batch_move_idx[64];
+            Value batch_scores[64];
+            int batch_count = 0;
+
+            for (size_t k = i; k < moves.size() && batch_count < 64; ++k) {
+                const Move cm = moves[k];
+                if (!in_check && !cm.is_promotion() && SEE::evaluate(board, cm) < 0) continue;
+                if (!board.make_move(cm)) continue;
+                if (!board.in_check()) {
+                    batch_boards[batch_count] = board;
+                    batch_move_idx[batch_count] = k;
+                    batch_count++;
+                }
+                board.unmake_move(cm);
+            }
+
+            if (batch_count > 1) {
+                Neural::g_neural_gpu.evaluate_batch_raw(batch_boards, batch_count, batch_scores, w.id);
+                for (int b = 0; b < batch_count; ++b) {
+                    q_child_evals[batch_move_idx[b]] = batch_scores[b];
+                }
+            }
+        }
+
         const Move m = moves[i];
         if (!in_check && !m.is_promotion() && SEE::evaluate(board, m) < 0) {
             continue;
@@ -305,6 +338,10 @@ Value Search::qsearch(Board& board, SearchWorker& w, int ply, Value alpha, Value
         w.move_stack[ply] = m;
         if (!board.make_move(m)) continue;
         legal_moves++;
+
+        if (ply + 1 < 128) {
+            w.eval_stack[ply + 1] = q_child_evals[i];
+        }
 
         Value score = -qsearch(board, w, ply + 1, -beta, -alpha, qply + 1);
         board.unmake_move(m);
@@ -418,6 +455,7 @@ Value Search::pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha
         // 3c. Null Move Pruning (checking side-to-move's non-pawn material + clearing move_stack)
         if (depth >= 3 && static_eval >= beta && board.has_non_pawn_material(board.side_to_move())) {
             w.move_stack[ply] = MOVE_NONE;
+            if (ply + 1 < 128) w.eval_stack[ply + 1] = VALUE_NONE;
             board.make_null_move();
             int R = null_move_reduction_ + depth / 4 + std::min(3, static_cast<int>(static_eval - beta) / 180);
             Value null_score = -pvs(board, w, depth - 1 - R, ply + 1, -beta, -beta + 1, !cut_node);
@@ -446,6 +484,7 @@ Value Search::pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha
                 const Move cm = captures[i];
                 if (SEE::evaluate(board, cm) < 0) continue;
                 w.move_stack[ply] = cm;
+                if (ply + 1 < 128) w.eval_stack[ply + 1] = VALUE_NONE;
                 if (!board.make_move(cm)) continue;
 
                 Value score = -qsearch(board, w, ply + 1, -probcut_beta, -probcut_beta + 1, 0);
@@ -489,17 +528,29 @@ Value Search::pvs(Board& board, SearchWorker& w, int depth, int ply, Value alpha
     for (size_t i = 0; i < moves.size(); ++i) {
         // After searching the first move (e.g. TT move), if no beta cutoff occurred,
         // batch-evaluate all remaining legal child positions in a single multi-block GPU launch!
-        if (moves_searched == 1 && !children_batched && (depth >= 2 || pv_node) && i + 1 < moves.size()) {
+        if (moves_searched == 1 && !children_batched && i + 1 < moves.size()) {
             if (check_time(true)) return VALUE_ZERO;
             children_batched = true;
             Board batch_boards[64];
             size_t batch_move_idx[64];
             Value batch_scores[64];
             int batch_count = 0;
+            int sim_moves_searched = moves_searched;
 
             for (size_t k = i; k < moves.size() && batch_count < 64; ++k) {
                 Move cm = moves[k];
+                bool cm_capture = (board.piece_at(cm.to_sq()) != NO_PIECE) || cm.is_en_passant();
+                bool cm_quiet = !cm_capture && !cm.is_promotion();
+                bool cm_check = board.gives_check(cm);
+
+                if (ply > 0 && !pv_node && !in_check && cm_quiet && !cm_check && best_score > -VALUE_MATE_THRESHOLD) {
+                    if (depth <= 4 && sim_moves_searched >= (3 + depth * depth) / (2 - (improving ? 1 : 0))) continue;
+                    if (depth <= 3 && static_eval + 110 * depth + 80 <= alpha) continue;
+                    if (depth <= 4 && SEE::evaluate(board, cm) < -60 * depth) continue;
+                }
+
                 if (!board.make_move(cm)) continue;
+                sim_moves_searched++;
                 if (!board.in_check()) {
                     batch_boards[batch_count] = board;
                     batch_move_idx[batch_count] = k;

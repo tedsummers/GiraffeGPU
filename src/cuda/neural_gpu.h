@@ -13,6 +13,7 @@
 namespace Neural {
 
 constexpr int IN_DIM = Giraffe::NUM_FEATURES; // 363
+constexpr int IN_DIM_PADDED = 364;            // Padded to multiple of 4 for vectorized float4 loads
 constexpr int L1_DIM = 512;
 constexpr int L2_DIM = 64;
 constexpr int OUT_DIM = 1;
@@ -20,6 +21,13 @@ constexpr int POLICY_DIM = 4096; // 64 from-squares * 64 to-squares
 
 constexpr int DEFAULT_MAX_BATCH = 512;
 constexpr int ALL_GPUS = -1;
+
+struct TrainingSample {
+    std::string fen;
+    float target_val;
+    int move_pol_idx;
+    float move_weight;
+};
 
 struct GPUDeviceInfo {
     int id;
@@ -34,13 +42,20 @@ struct DeviceContext {
     int max_batch_size;
     bool initialized;
 
-    // Pinned host buffers for fast PCIe transfer
+    // Pinned host buffers for fast PCIe transfer & zero-copy mapped access
     float* h_input_batch;
     float* h_output_batch;
     float* h_policy_batch;
+    float* h_h2_batch;
+
+    // Mapped device pointers into pinned host memory (eliminates H2D/D2H memcpy for small batches)
+    float* d_mapped_input;
+    float* d_mapped_output;
+    float* d_mapped_h2;
 
     // Device weights
     float* d_w1;
+    float* d_w1_padded;
     float* d_b1;
     float* d_w2;
     float* d_b2;
@@ -122,6 +137,16 @@ public:
 
     // Parallel multi-GPU batched evaluation
     void evaluate_batch(const std::vector<Board>& boards, std::vector<Value>& out_scores);
+
+    // Full-network GPU backpropagation (Value + Policy heads across all layers w1..w3, w_pol)
+    bool train_on_gpu(
+        const std::vector<TrainingSample>& samples,
+        int epochs = 25,
+        float lr = 0.0005f,
+        float policy_lr = 0.001f,
+        float l2_reg = 0.0002f,
+        float max_output_delta = 0.06f,
+        int batch_size = 256);
 
     int current_device() const { return device_id_; }
     int max_batch_size() const { return max_batch_size_; }

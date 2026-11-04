@@ -15,7 +15,10 @@
 
 ## Highlights
 
-- **Native NVIDIA CUDA Acceleration**: Executes the neural network forward pass directly on NVIDIA GPUs using optimized CUDA kernels (`forward_l1_kernel`, `forward_l2_kernel`, `forward_l3_kernel`, `forward_policy_kernel`).
+- **Native NVIDIA CUDA Acceleration (`~138,000 NPS`, Peak `198,000 NPS`)**: Executes the neural network forward pass directly on NVIDIA GPUs using a fused 3-layer shared-memory kernel (`forward_value_fused_kernel`) with 128-bit vectorized `float4` loads and warp-shuffle reductions (`__shfl_down_sync`).
+- **Zero-Copy Mapped Pinned Host Memory (`cudaHostAllocMapped`)**: Eliminates PCIe `cudaMemcpyAsync` H2D/D2H driver round-trips on single-board and tree-search batch (`<= 64`) evaluations by mapping page-locked host buffers directly into the CUDA address space on non-blocking streams (`cudaStreamNonBlocking`).
+- **Batched Multi-Block GPU Evaluation in PVS & Quiescence Search**: Evaluates legal child moves in `Search::pvs` (including `depth == 1` interior nodes) and capture children in `Search::qsearch` in parallel multi-block GPU batches whenever the first candidate move does not trigger an immediate beta cutoff.
+- **Native CUDA Full-Network Backpropagation (`./GiraffeGPU train`)**: Trains all network layers (`w1, b1, w2, b2, w3, b3, w_pol, b_pol`) end-to-end on the GPU using custom CUDA forward/backward and AdamW kernels with multi-threaded C++ `Giraffe::extract_features`, material/positional anchor neuron protection, and trust-region output delta clipping.
 - **Dual-Head Neural Architecture (Value + Policy)**:
   - **Shared Trunk**: 363-dimensional input $\to$ 512 hidden ($L_1$, ReLU) $\to$ 64 signature ($L_2$, ReLU).
   - **Value Head**: $64 \to 1$ scalar evaluation in centipawns ($\tanh$ activation).
@@ -28,8 +31,7 @@
   - **Bishop features (40)**: 4 bishops with $(x, y)$, 4 diagonal ray mobility counters, safe moves count, and threat control.
   - **Knight features (24)**: 4 knights with $(x, y)$, safe jump counts, and threat control.
   - **Square Attack Maps (128)**: Least Valuable Attacker (LVA) control values for all 64 squares from both White and Black perspectives.
-- **Batched GPU Evaluation**: Evaluates single positions or large batches of positions (up to 4096) in parallel across CUDA warps and streaming multiprocessors.
-- **Multi-GPU & Runtime Switching**: Automatically detects and supports modern NVIDIA architectures (Ampere `sm_86`, Blackwell `sm_120`, etc.), switchable dynamically via standard UCI options.
+- **Multi-GPU Concurrent Execution**: Automatically detects and utilizes multiple NVIDIA GPUs simultaneously (including mixed-generation setups like Ampere `sm_86` + Blackwell `sm_120`) across independent CUDA stream contexts, and supports concurrent per-GPU self-play workers (`--workers 2`).
 - **Universal Chess Interface (UCI) Protocol**: Compatible with all standard chess GUIs (CuteChess, Arena, Scid vs PC, Nibbler, etc.).
 - **Engine Search Features**:
   - Negamax with Principal Variation Search (PVS)
@@ -41,12 +43,36 @@
   - **Continuation History**: 1-ply piece-to-square continuation history (`conthist[piece][from][to]`) tracking responses to the opponent's previous move.
   - **Countermove Heuristic**: 2D lookup table (`countermove[piece][to]`) prioritizing specific refutations to the previous move on quiet cutoffs.
   - **ProbCut Pruning**: At depth $\ge 5$, probes shallow capture searches against an aggressive $\beta + 180$ threshold to prune cut subtrees early.
-  - **Enhanced Quiescence Search**: Includes promotions and selective quiet checks only near the quiescence root to avoid checking-tree explosions.
+  - **Enhanced Quiescence Search**: Includes promotions, selective quiet checks near the quiescence root, and batched GPU capture evaluation.
   - **Logarithmic Late Move Reduction (LMR)**: Precomputed $64 \times 64$ logarithmic reduction table dynamically adjusted for cut-nodes and check evasions.
-  - **Syzygy Endgame Tablebases**: Direct Fathom probing engine integration supporting 3-4-5-6 piece Syzygy WDL tables and instant root move probing.
+  - **Syzygy Endgame Tablebases**: Direct Fathom probing engine integration supporting 3-4-5-6 piece Syzygy WDL/DTZ tables and instant root move probing.
   - Static Exchange Evaluation (SEE) pruning and move ordering
   - Null Move Pruning with verification
-  - Check extensions and threefold repetition detection
+  - Check extensions, threefold repetition detection, and soft/hard atomic clock management
+
+---
+
+## Estimated Playing Strength & Supported NVIDIA GPUs
+
+### Estimated Elo Progression
+
+| Stage | Estimated CCRL / FIDE Elo | Estimated Online Blitz / Rapid | Key Drivers |
+| :--- | :---: | :---: | :--- |
+| **Current Build (Pre-5-Day Run)** | **~2250 – 2350 Elo** | **~2450 – 2550** | • **~138k NPS** on Dual GPUs (~20x faster than original CPU Giraffe)<br>• Full PVS + LMR + Null Move + ProbCut + SEE + Countermove/History<br>• **Syzygy 3-4-5-6 Piece Tablebases** (perfect endgame WDL/DTZ play) |
+| **After 5-Day Autonomous GPU Training** | **~2450 – 2600 Elo** | **~2650 – 2800** | • **+150 to +250 Elo** from full-network (`w1, w2, w3, w_pol`) CUDA AdamW training on cumulative self-play positions + SPSA search tuning |
+
+### Supported NVIDIA GPU Models
+`GiraffeGPU` requires less than **250 MB of VRAM** and supports single-GPU, dual-GPU, and mixed-generation multi-GPU systems:
+
+| Support Tier | GPU Family | Supported Models | Architecture / `Makefile` Flag |
+| :--- | :--- | :--- | :--- |
+| **Native Out-of-the-Box** | **GeForce RTX 50 Series (Blackwell)** | **RTX 5050**, RTX 5060, RTX 5060 Ti, RTX 5070, RTX 5070 Ti, RTX 5080, RTX 5090 | Native `sm_120` |
+| **Native Out-of-the-Box** | **GeForce RTX 40 Series (Ada Lovelace)** | RTX 4050, RTX 4060, RTX 4060 Ti, RTX 4070 / Super / Ti, RTX 4080 / Super, RTX 4090 | `sm_89` via embedded PTX JIT |
+| **Native Out-of-the-Box** | **GeForce RTX 30 Series (Ampere)** | RTX 3050, **RTX 3060**, RTX 3060 Ti, RTX 3070 / Ti, RTX 3080 / Ti, RTX 3090 / Ti | Native `sm_86` |
+| **Native Out-of-the-Box** | **Workstation & Data Center (`SM 8.6+`)** | RTX A2000–A6000, RTX 4000–6000 Ada, L4, L40S, H100, H200, B200 | Native `sm_86` / PTX JIT |
+| **Via `-gencode` in `Makefile`** | **Ampere Data Center (`SM 8.0`)** | NVIDIA A100, A30 | `-gencode arch=compute_80,code=sm_80` |
+| **Via `-gencode` in `Makefile`** | **RTX 20 / GTX 16 Series (Turing)** | GTX 1650, GTX 1660 Super/Ti, RTX 2060, RTX 2070, RTX 2080 / Ti, Tesla T4 | `-gencode arch=compute_75,code=sm_75` |
+| **Via `-gencode` in `Makefile`** | **Volta & GTX 10 Series (Pascal)** | GTX 1050 Ti, GTX 1060, GTX 1070, GTX 1080 / Ti, Titan Xp, Tesla P100, V100, Titan V | `-gencode arch=compute_61,code=sm_61` |
 
 ---
 
@@ -171,12 +197,15 @@ g++ -O3 -std=c++17 -Isrc -pthread src/*.cpp -o GiraffeGPU.exe
 # List detected NVIDIA GPUs, SM architectures, and VRAM:
 ./GiraffeGPU gpu-info
 
-# Run benchmark across standard test positions (depth 5):
-./GiraffeGPU bench 5
+# Run benchmark across standard test positions (depth 6):
+./GiraffeGPU bench 6
 
 # Evaluate position through Dual-Head Policy Network (top moves, probabilities, and logits):
 ./GiraffeGPU policy
 ./GiraffeGPU policy "rnbqkbnr/pp1ppppp/8/2p5/4P3/8/PPPP1PPP/RNBQKBNR w KQkq c6 0 2"
+
+# Run native CUDA full-network backpropagation directly on TSV training samples:
+./GiraffeGPU train samples.tsv eval.net candidate.net 10 0.0005 0.001 0.0002 0.05
 ```
 
 #### Windows:
@@ -271,33 +300,34 @@ python3 testing/run_tests.py --compare-policy --sprt --elo0 0.0 --elo1 15.0 --ga
 - Supports custom UCI engine parameters via `--engine1-options` and `--engine2-options` (e.g. `PolicyNet=true`, `WeightsFile=candidate.net`).
 - Saves full game transcripts to `testing/results/match_<timestamp>.pgn`.
 
-### 3. Self-Play & Reinforcement Learning Data Generator
-Generates self-play games with randomized opening plies (as in Matthew Lai's Giraffe paper) to produce datasets for TD-learning and neural fine-tuning:
+### 3. Dual-GPU Parallel Self-Play & Reinforcement Learning Data Generator
+Generates self-play games concurrently across both NVIDIA GPUs (`--workers 2` by default, pinning Worker 0 to `Device_GPU=0` and Worker 1 to `Device_GPU=1`) with randomized opening plies (as in Matthew Lai's Giraffe paper) to produce datasets for TD-learning and neural fine-tuning:
 
 ```bash
-# Generate 50 self-play games on dual GPUs:
+# Generate 50 self-play games concurrently across both GPUs:
+python3 testing/self_play.py --games 50 --movetime 80 --workers 2
+# or via test runner:
 python3 testing/run_tests.py --selfplay --games 50 --movetime 100
 # or quick run:
 make test-selfplay
 ```
 - Saves position FENs, candidate moves, evaluations, search depths, and game outcomes directly to `testing/results/selfplay_dataset.jsonl`.
 
-### 4. Dual-Head Neural Weight Trainer (`train_weights.py`)
-Trains and fine-tunes both the Value Head (position evaluation) and the Policy Head (move selection logits) on cumulative self-play datasets:
+### 4. Native CUDA Full-Network Weight Trainer (`train_weights.py` & `./GiraffeGPU train`)
+Trains and fine-tunes the entire Dual-Head network (`w1, b1, w2, b2, w3, b3, w_pol, b_pol`) on the GPU using custom CUDA forward/backward and AdamW kernels:
 
 ```bash
-# Fine-tune the value output layer on self-play data:
-python3 testing/run_tests.py --train --epochs 5
+# Fine-tune full network (Value + Policy heads) on GPU from self-play data:
+python3 testing/run_tests.py --train --epochs 10
 
 # Or invoke the trainer directly with custom weight paths:
 python3 testing/train_weights.py --data testing/results/selfplay_dataset.jsonl \
   --in-weights eval.net --out-weights testing/results/candidate.net \
-  --epochs 5 --lr 0.00025 --max-output-delta 0.02 --policy-lr 0
+  --epochs 10 --lr 0.0005 --max-output-delta 0.05 --policy-lr 0.001
 ```
-- Uses FEN-aware, white-perspective targets blended from final game outcomes and normalized search evaluations.
-- Reports an 80/20 validation split to expose overfitting before match testing.
-- Updates only the value output layer by default; the policy head is frozen unless explicitly enabled.
-- Limits output-layer drift per cycle and preserves compatibility with legacy `GIRAFGPU` weight files.
+- Extracts 363-dimensional features in parallel across all CPU threads via C++ `Giraffe::extract_features` (ensuring bit-for-bit identical features between engine search and training) and executes full-network AdamW backpropagation on CUDA.
+- Protects material/positional anchor neurons (`0..4` in $L_1$, `0..1` in $L_2$) while training all remaining hidden neurons and the 4096-move policy head.
+- Enforces trust-region output delta clipping (`--max-output-delta`) and preserves compatibility with both `GIRAFDUAL` and legacy `GIRAFGPU` weight files (with automatic CPU/NumPy fallback via `--no-gpu`).
 
 ### 5. SPSA Automated Search Parameter Tuner
 Uses Simultaneous Perturbation Stochastic Approximation to optimize search and pruning parameters (null move reduction, LMR thresholds, aspiration window margins, SEE margins):

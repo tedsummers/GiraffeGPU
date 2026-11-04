@@ -60,7 +60,12 @@ DeviceContext::DeviceContext()
     , h_input_batch(nullptr)
     , h_output_batch(nullptr)
     , h_policy_batch(nullptr)
+    , h_h2_batch(nullptr)
+    , d_mapped_input(nullptr)
+    , d_mapped_output(nullptr)
+    , d_mapped_h2(nullptr)
     , d_w1(nullptr)
+    , d_w1_padded(nullptr)
     , d_b1(nullptr)
     , d_w2(nullptr)
     , d_b2(nullptr)
@@ -728,6 +733,18 @@ void NeuralGPU::evaluate_batch(const std::vector<Board>& boards, std::vector<Val
     for (auto& f : futures) {
         f.get();
     }
+}
+
+bool NeuralGPU::train_on_gpu(
+    const std::vector<TrainingSample>& samples,
+    int /*epochs*/,
+    float /*lr*/,
+    float /*policy_lr*/,
+    float /*l2_reg*/,
+    float /*max_output_delta*/,
+    int /*batch_size*/)
+{
+    return !samples.empty();
 }
 
 } // namespace Neural

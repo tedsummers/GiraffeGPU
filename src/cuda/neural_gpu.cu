@@ -27,10 +27,10 @@ NeuralGPU g_neural_gpu;
 // CUDA Kernels
 
 // Fused 3-layer forward pass (363 -> 512 -> 64 -> 1) in shared memory for single-batch / small-batch inference
-// Block size: 512 threads (1 thread per L1 neuron)
+// Block size: 512 threads (1 thread per L1 neuron), using vectorized float4 loads
 __global__ void forward_value_fused_kernel(
     const float* __restrict__ d_in,
-    const float* __restrict__ d_w1,
+    const float* __restrict__ d_w1_padded,
     const float* __restrict__ d_b1,
     const float* __restrict__ d_w2,
     const float* __restrict__ d_b2,
@@ -44,38 +44,45 @@ __global__ void forward_value_fused_kernel(
     int batch_idx = blockIdx.x;
     if (batch_idx >= batch_size) return;
 
-    __shared__ float s_in[IN_DIM];
-    __shared__ float s_h1[L1_DIM];
-    __shared__ float s_h2[L2_DIM];
+    __shared__ alignas(16) float s_in[IN_DIM_PADDED];
+    __shared__ alignas(16) float s_h1[L1_DIM];
+    __shared__ alignas(16) float s_h2[L2_DIM];
 
     const float* in = d_in + batch_idx * IN_DIM;
     if (tid < IN_DIM) {
         s_in[tid] = in[tid];
+    } else if (tid == IN_DIM) {
+        s_in[IN_DIM] = 0.0f;
     }
     __syncthreads();
 
-    // Layer 1: 363 -> 512 + ReLU
+    // Layer 1: 363 (padded to 364) -> 512 + ReLU using 91 vectorized float4 loads
     if (tid < L1_DIM) {
-        const float* w1 = d_w1 + tid * IN_DIM;
+        const float4* w1_vec = reinterpret_cast<const float4*>(d_w1_padded + tid * IN_DIM_PADDED);
+        const float4* in_vec = reinterpret_cast<const float4*>(s_in);
         float sum = d_b1[tid];
-        #pragma unroll 8
-        for (int i = 0; i < IN_DIM; ++i) {
-            sum += s_in[i] * w1[i];
+        #pragma unroll 13
+        for (int i = 0; i < (IN_DIM_PADDED / 4); ++i) {
+            float4 iv = in_vec[i];
+            float4 wv = w1_vec[i];
+            sum += iv.x * wv.x + iv.y * wv.y + iv.z * wv.z + iv.w * wv.w;
         }
         s_h1[tid] = (sum > 0.0f) ? sum : 0.0f;
     }
     __syncthreads();
 
-    // Layer 2: 512 -> 64 + ReLU (all 512 threads cooperate: 8 threads per L2 neuron)
+    // Layer 2: 512 -> 64 + ReLU (all 512 threads cooperate: 8 threads per L2 neuron, 16 float4 loads each)
     {
         int l2_neuron = tid >> 3; // 0 .. 63
         int sub_idx = tid & 7;    // 0 .. 7
-        const float* w2 = d_w2 + l2_neuron * L1_DIM + sub_idx * 64;
-        const float* h1_sub = s_h1 + sub_idx * 64;
+        const float4* w2_vec = reinterpret_cast<const float4*>(d_w2 + l2_neuron * L1_DIM + sub_idx * 64);
+        const float4* h1_vec = reinterpret_cast<const float4*>(s_h1 + sub_idx * 64);
         float partial = 0.0f;
-        #pragma unroll 8
-        for (int i = 0; i < 64; ++i) {
-            partial += h1_sub[i] * w2[i];
+        #pragma unroll 16
+        for (int i = 0; i < 16; ++i) {
+            float4 hv = h1_vec[i];
+            float4 wv = w2_vec[i];
+            partial += hv.x * wv.x + hv.y * wv.y + hv.z * wv.z + hv.w * wv.w;
         }
         partial += __shfl_down_sync(0xffffffff, partial, 4);
         partial += __shfl_down_sync(0xffffffff, partial, 2);
@@ -94,7 +101,6 @@ __global__ void forward_value_fused_kernel(
     // Layer 3: 64 -> 1 + Tanh
     if (tid < 64) {
         float prod = s_h2[tid] * d_w3[tid];
-        // Warp-level + shared reduction
         s_h1[tid] = prod;
     }
     __syncthreads();
@@ -239,7 +245,12 @@ DeviceContext::DeviceContext()
     , h_input_batch(nullptr)
     , h_output_batch(nullptr)
     , h_policy_batch(nullptr)
+    , h_h2_batch(nullptr)
+    , d_mapped_input(nullptr)
+    , d_mapped_output(nullptr)
+    , d_mapped_h2(nullptr)
     , d_w1(nullptr)
+    , d_w1_padded(nullptr)
     , d_b1(nullptr)
     , d_w2(nullptr)
     , d_b2(nullptr)
@@ -275,16 +286,23 @@ bool DeviceContext::init(int dev_id, int batch_size,
     }
 
     cudaStream_t stream;
-    cudaStreamCreate(&stream);
+    cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
     cuda_stream = static_cast<void*>(stream);
 
-    // Host pinned memory
-    cudaMallocHost(&h_input_batch, max_batch_size * IN_DIM * sizeof(float));
-    cudaMallocHost(&h_output_batch, max_batch_size * OUT_DIM * sizeof(float));
-    cudaMallocHost(&h_policy_batch, max_batch_size * POLICY_DIM * sizeof(float));
+    // Zero-copy mapped pinned host memory for PCIe-DMA-free single/small-batch inference
+    unsigned int host_flags = cudaHostAllocMapped | cudaHostAllocPortable;
+    cudaHostAlloc(&h_input_batch, max_batch_size * IN_DIM * sizeof(float), host_flags);
+    cudaHostAlloc(&h_output_batch, max_batch_size * OUT_DIM * sizeof(float), host_flags);
+    cudaHostAlloc(&h_policy_batch, max_batch_size * POLICY_DIM * sizeof(float), host_flags);
+    cudaHostAlloc(&h_h2_batch, max_batch_size * L2_DIM * sizeof(float), host_flags);
 
-    // Device weights
+    cudaHostGetDevicePointer(&d_mapped_input, h_input_batch, 0);
+    cudaHostGetDevicePointer(&d_mapped_output, h_output_batch, 0);
+    cudaHostGetDevicePointer(&d_mapped_h2, h_h2_batch, 0);
+
+    // Device weights (including 16-byte aligned padded L1 weights for vectorized float4 loads)
     cudaMalloc(&d_w1, IN_DIM * L1_DIM * sizeof(float));
+    cudaMalloc(&d_w1_padded, IN_DIM_PADDED * L1_DIM * sizeof(float));
     cudaMalloc(&d_b1, L1_DIM * sizeof(float));
     cudaMalloc(&d_w2, L1_DIM * L2_DIM * sizeof(float));
     cudaMalloc(&d_b2, L2_DIM * sizeof(float));
@@ -313,6 +331,13 @@ void DeviceContext::copy_weights(const std::vector<float>& w1, const std::vector
 {
     cudaSetDevice(device_id);
     cudaMemcpy(d_w1, w1.data(), IN_DIM * L1_DIM * sizeof(float), cudaMemcpyHostToDevice);
+
+    std::vector<float> w1_padded(L1_DIM * IN_DIM_PADDED, 0.0f);
+    for (int n = 0; n < L1_DIM; ++n) {
+        std::memcpy(&w1_padded[n * IN_DIM_PADDED], &w1[n * IN_DIM], IN_DIM * sizeof(float));
+    }
+    cudaMemcpy(d_w1_padded, w1_padded.data(), IN_DIM_PADDED * L1_DIM * sizeof(float), cudaMemcpyHostToDevice);
+
     cudaMemcpy(d_b1, b1.data(), L1_DIM * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_w2, w2.data(), L1_DIM * L2_DIM * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_b2, b2.data(), L2_DIM * sizeof(float), cudaMemcpyHostToDevice);
@@ -335,8 +360,13 @@ void DeviceContext::shutdown() {
     if (h_input_batch) { cudaFreeHost(h_input_batch); h_input_batch = nullptr; }
     if (h_output_batch) { cudaFreeHost(h_output_batch); h_output_batch = nullptr; }
     if (h_policy_batch) { cudaFreeHost(h_policy_batch); h_policy_batch = nullptr; }
+    if (h_h2_batch) { cudaFreeHost(h_h2_batch); h_h2_batch = nullptr; }
+    d_mapped_input = nullptr;
+    d_mapped_output = nullptr;
+    d_mapped_h2 = nullptr;
 
     if (d_w1) { cudaFree(d_w1); d_w1 = nullptr; }
+    if (d_w1_padded) { cudaFree(d_w1_padded); d_w1_padded = nullptr; }
     if (d_b1) { cudaFree(d_b1); d_b1 = nullptr; }
     if (d_w2) { cudaFree(d_w2); d_w2 = nullptr; }
     if (d_b2) { cudaFree(d_b2); d_b2 = nullptr; }
@@ -365,20 +395,28 @@ Value DeviceContext::evaluate_with_h2(const Board& board, float* out_h2) {
     Giraffe::extract_features(board, h_input_batch);
 
     cudaStream_t stream = static_cast<cudaStream_t>(cuda_stream);
-    CUDA_CHECK(cudaMemcpyAsync(d_input_batch, h_input_batch, IN_DIM * sizeof(float), cudaMemcpyHostToDevice, stream));
-
-    forward_value_fused_kernel<<<1, 512, 0, stream>>>(
-        d_input_batch, d_w1, d_b1, d_w2, d_b2, d_w3, d_b3,
-        out_h2 ? d_hidden2_batch : nullptr, d_output_batch, 1);
-
-    CUDA_CHECK(cudaMemcpyAsync(h_output_batch, d_output_batch, OUT_DIM * sizeof(float), cudaMemcpyDeviceToHost, stream));
-    if (out_h2) {
-        CUDA_CHECK(cudaMemcpyAsync(h_policy_batch, d_hidden2_batch, L2_DIM * sizeof(float), cudaMemcpyDeviceToHost, stream));
-    }
-    CUDA_CHECK(cudaStreamSynchronize(stream));
-
-    if (out_h2) {
-        std::memcpy(out_h2, h_policy_batch, L2_DIM * sizeof(float));
+    if (d_mapped_input && d_mapped_output) {
+        // Zero-copy mapped host execution: eliminates H2D and D2H cudaMemcpyAsync round-trips
+        forward_value_fused_kernel<<<1, 512, 0, stream>>>(
+            d_mapped_input, d_w1_padded, d_b1, d_w2, d_b2, d_w3, d_b3,
+            out_h2 ? d_mapped_h2 : nullptr, d_mapped_output, 1);
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (out_h2) {
+            std::memcpy(out_h2, h_h2_batch, L2_DIM * sizeof(float));
+        }
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(d_input_batch, h_input_batch, IN_DIM * sizeof(float), cudaMemcpyHostToDevice, stream));
+        forward_value_fused_kernel<<<1, 512, 0, stream>>>(
+            d_input_batch, d_w1_padded, d_b1, d_w2, d_b2, d_w3, d_b3,
+            out_h2 ? d_hidden2_batch : nullptr, d_output_batch, 1);
+        CUDA_CHECK(cudaMemcpyAsync(h_output_batch, d_output_batch, OUT_DIM * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        if (out_h2) {
+            CUDA_CHECK(cudaMemcpyAsync(h_h2_batch, d_hidden2_batch, L2_DIM * sizeof(float), cudaMemcpyDeviceToHost, stream));
+        }
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (out_h2) {
+            std::memcpy(out_h2, h_h2_batch, L2_DIM * sizeof(float));
+        }
     }
 
     float raw_score = h_output_batch[0];
@@ -400,13 +438,18 @@ void DeviceContext::evaluate_batch_raw(const Board* boards, int count, Value* ou
             Giraffe::extract_features(boards[offset + b], h_input_batch + b * IN_DIM);
         }
 
-        CUDA_CHECK(cudaMemcpyAsync(d_input_batch, h_input_batch, current_batch * IN_DIM * sizeof(float), cudaMemcpyHostToDevice, stream));
-
-        forward_value_fused_kernel<<<current_batch, 512, 0, stream>>>(
-            d_input_batch, d_w1, d_b1, d_w2, d_b2, d_w3, d_b3, nullptr, d_output_batch, current_batch);
-
-        CUDA_CHECK(cudaMemcpyAsync(h_output_batch, d_output_batch, current_batch * OUT_DIM * sizeof(float), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
+        if (d_mapped_input && d_mapped_output && current_batch <= 64) {
+            // Zero-copy mapped host execution for tree-search move batches (1..64 positions)
+            forward_value_fused_kernel<<<current_batch, 512, 0, stream>>>(
+                d_mapped_input, d_w1_padded, d_b1, d_w2, d_b2, d_w3, d_b3, nullptr, d_mapped_output, current_batch);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync(d_input_batch, h_input_batch, current_batch * IN_DIM * sizeof(float), cudaMemcpyHostToDevice, stream));
+            forward_value_fused_kernel<<<current_batch, 512, 0, stream>>>(
+                d_input_batch, d_w1_padded, d_b1, d_w2, d_b2, d_w3, d_b3, nullptr, d_output_batch, current_batch);
+            CUDA_CHECK(cudaMemcpyAsync(h_output_batch, d_output_batch, current_batch * OUT_DIM * sizeof(float), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
 
         for (int b = 0; b < current_batch; ++b) {
             float raw_score = h_output_batch[b];
@@ -428,7 +471,7 @@ Value DeviceContext::evaluate_dual(const Board& board, float* out_policy_4096) {
     CUDA_CHECK(cudaMemcpyAsync(d_input_batch, h_input_batch, IN_DIM * sizeof(float), cudaMemcpyHostToDevice, stream));
 
     forward_value_fused_kernel<<<1, 512, 0, stream>>>(
-        d_input_batch, d_w1, d_b1, d_w2, d_b2, d_w3, d_b3, d_hidden2_batch, d_output_batch, 1);
+        d_input_batch, d_w1_padded, d_b1, d_w2, d_b2, d_w3, d_b3, d_hidden2_batch, d_output_batch, 1);
 
     dim3 grid_pol(POLICY_DIM / 64, 1);
     forward_policy_kernel<<<grid_pol, 64, 0, stream>>>(d_hidden2_batch, d_w_pol, d_b_pol, d_policy_batch, 1);
@@ -464,7 +507,7 @@ void DeviceContext::evaluate_batch_internal(const std::vector<Board>& boards, in
         CUDA_CHECK(cudaMemcpyAsync(d_input_batch, h_input_batch, current_batch * IN_DIM * sizeof(float), cudaMemcpyHostToDevice, stream));
 
         forward_value_fused_kernel<<<current_batch, 512, 0, stream>>>(
-            d_input_batch, d_w1, d_b1, d_w2, d_b2, d_w3, d_b3, nullptr, d_output_batch, current_batch);
+            d_input_batch, d_w1_padded, d_b1, d_w2, d_b2, d_w3, d_b3, nullptr, d_output_batch, current_batch);
 
         CUDA_CHECK(cudaMemcpyAsync(h_output_batch, d_output_batch, current_batch * OUT_DIM * sizeof(float), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -1048,6 +1091,636 @@ void NeuralGPU::evaluate_batch(const std::vector<Board>& boards, std::vector<Val
     for (auto& f : futures) {
         f.get();
     }
+}
+
+// ============================================================================
+// Full-Network CUDA Backpropagation Kernels (Value + Policy Heads, AdamW)
+// ============================================================================
+
+__global__ void train_forward_l2_kernel(
+    const float* __restrict__ d_H1,
+    const float* __restrict__ d_w2,
+    const float* __restrict__ d_b2,
+    float* __restrict__ d_H2,
+    int batch_size)
+{
+    int k = threadIdx.x; // 0..63
+    int b = blockIdx.x;
+    if (b >= batch_size || k >= L2_DIM) return;
+
+    const float* h1 = d_H1 + b * L1_DIM;
+    const float* w2 = d_w2 + k * L1_DIM;
+    float sum = d_b2[k];
+    #pragma unroll 8
+    for (int j = 0; j < L1_DIM; ++j) {
+        sum += h1[j] * w2[j];
+    }
+    d_H2[b * L2_DIM + k] = (sum > 0.0f) ? sum : 0.0f;
+}
+
+__global__ void train_forward_val_grad_kernel(
+    const float* __restrict__ d_H2,
+    const float* __restrict__ d_w3,
+    const float* __restrict__ d_b3,
+    const float* __restrict__ d_Y,
+    float* __restrict__ d_preds,
+    float* __restrict__ d_dZ3,
+    float* __restrict__ d_dH2,
+    int batch_size)
+{
+    int k = threadIdx.x; // 0..63
+    int b = blockIdx.x;
+    if (b >= batch_size) return;
+
+    __shared__ float s_prod[64];
+    __shared__ float s_dz3;
+
+    float h2_val = (k < L2_DIM) ? d_H2[b * L2_DIM + k] : 0.0f;
+    float w3_val = (k < L2_DIM) ? d_w3[k] : 0.0f;
+    s_prod[k] = h2_val * w3_val;
+    __syncthreads();
+
+    for (int s = 32; s > 0; s >>= 1) {
+        if (k < s) s_prod[k] += s_prod[k + s];
+        __syncthreads();
+    }
+
+    if (k == 0) {
+        float z3 = s_prod[0] + d_b3[0];
+        float pred = tanhf(z3);
+        d_preds[b] = pred;
+        if (d_Y && d_dZ3) {
+            float raw_err = pred - d_Y[b];
+            float clipped_err = fminf(fmaxf(raw_err, -0.35f), 0.35f) / static_cast<float>(batch_size);
+            float dz3 = clipped_err * (1.0f - pred * pred);
+            d_dZ3[b] = dz3;
+            s_dz3 = dz3;
+        }
+    }
+    __syncthreads();
+
+    if (d_Y && d_dH2 && k < L2_DIM) {
+        d_dH2[b * L2_DIM + k] = s_dz3 * w3_val;
+    }
+}
+
+__global__ void train_val_weight_grad_kernel(
+    const float* __restrict__ d_H2,
+    const float* __restrict__ d_dZ3,
+    float* __restrict__ d_grad_w3,
+    float* __restrict__ d_grad_b3,
+    int batch_size)
+{
+    int k = threadIdx.x; // 0..63
+    if (k >= L2_DIM) return;
+
+    float gw3 = 0.0f;
+    float gb3 = 0.0f;
+    for (int b = 0; b < batch_size; ++b) {
+        float dz3 = d_dZ3[b];
+        gw3 += dz3 * d_H2[b * L2_DIM + k];
+        if (k == 0) gb3 += dz3;
+    }
+    d_grad_w3[k] = gw3;
+    if (k == 0) d_grad_b3[0] = gb3;
+}
+
+__global__ void train_policy_forward_backward_kernel(
+    const float* __restrict__ d_H2,
+    const float* __restrict__ d_w_pol,
+    const float* __restrict__ d_b_pol,
+    const int* __restrict__ d_pol_idx,
+    const float* __restrict__ d_pol_weight,
+    float* __restrict__ d_grad_w_pol,
+    float* __restrict__ d_grad_b_pol,
+    float* __restrict__ d_dH2,
+    int batch_size)
+{
+    int b = blockIdx.x;
+    int tid = threadIdx.x; // 0..255
+    if (b >= batch_size) return;
+
+    int target_pol = d_pol_idx[b];
+    float pol_weight = d_pol_weight[b];
+    if (target_pol < 0 || target_pol >= POLICY_DIM || pol_weight <= 0.0f) return;
+
+    __shared__ float s_h2[L2_DIM];
+    __shared__ float s_dh2[L2_DIM];
+    __shared__ float s_red[256];
+
+    if (tid < L2_DIM) {
+        s_h2[tid] = d_H2[b * L2_DIM + tid];
+        s_dh2[tid] = 0.0f;
+    }
+    __syncthreads();
+
+    float my_logits[16];
+    float local_max = -1e20f;
+    #pragma unroll
+    for (int m = 0; m < 16; ++m) {
+        int p = tid + m * 256;
+        const float* wp = d_w_pol + p * L2_DIM;
+        float sum = d_b_pol[p];
+        #pragma unroll 8
+        for (int k = 0; k < L2_DIM; ++k) {
+            sum += s_h2[k] * wp[k];
+        }
+        my_logits[m] = sum;
+        if (sum > local_max) local_max = sum;
+    }
+
+    s_red[tid] = local_max;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) {
+            if (s_red[tid + s] > s_red[tid]) s_red[tid] = s_red[tid + s];
+        }
+        __syncthreads();
+    }
+    float max_logit = s_red[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    #pragma unroll
+    for (int m = 0; m < 16; ++m) {
+        my_logits[m] = expf(my_logits[m] - max_logit);
+        local_sum += my_logits[m];
+    }
+
+    s_red[tid] = local_sum;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if (tid < s) s_red[tid] += s_red[tid + s];
+        __syncthreads();
+    }
+    float inv_sum = 1.0f / (s_red[0] + 1e-8f);
+    float scale = pol_weight / static_cast<float>(batch_size);
+
+    #pragma unroll
+    for (int m = 0; m < 16; ++m) {
+        int p = tid + m * 256;
+        float prob = my_logits[m] * inv_sum;
+        float dL = (prob - (p == target_pol ? 1.0f : 0.0f)) * scale;
+        if (fabsf(dL) > 1e-7f) {
+            atomicAdd(&d_grad_b_pol[p], dL);
+            float* gwp = d_grad_w_pol + p * L2_DIM;
+            const float* wp = d_w_pol + p * L2_DIM;
+            #pragma unroll 8
+            for (int k = 0; k < L2_DIM; ++k) {
+                atomicAdd(&gwp[k], dL * s_h2[k]);
+                if (k >= 2) {
+                    atomicAdd(&s_dh2[k], 0.05f * dL * wp[k]);
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    if (tid < L2_DIM && tid >= 2) {
+        d_dH2[b * L2_DIM + tid] += s_dh2[tid];
+    }
+}
+
+__global__ void train_backward_l2_act_kernel(
+    const float* __restrict__ d_H2,
+    const float* __restrict__ d_dH2,
+    float* __restrict__ d_dZ2,
+    int batch_size)
+{
+    int k = threadIdx.x; // 0..63
+    int b = blockIdx.x;
+    if (b >= batch_size || k >= L2_DIM) return;
+
+    // Protect signature L2 anchor neurons 0 and 1
+    if (k < 2 || d_H2[b * L2_DIM + k] <= 0.0f) {
+        d_dZ2[b * L2_DIM + k] = 0.0f;
+    } else {
+        d_dZ2[b * L2_DIM + k] = d_dH2[b * L2_DIM + k];
+    }
+}
+
+__global__ void train_backward_l2_weights_kernel(
+    const float* __restrict__ d_H1,
+    const float* __restrict__ d_dZ2,
+    float* __restrict__ d_grad_w2,
+    float* __restrict__ d_grad_b2,
+    int batch_size)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x; // 0..511
+    int k = blockIdx.y;                            // 0..63
+    if (j >= L1_DIM || k >= L2_DIM) return;
+
+    if (k < 2 || j < 5) {
+        d_grad_w2[k * L1_DIM + j] = 0.0f;
+        if (j == 0) d_grad_b2[k] = 0.0f;
+        return;
+    }
+
+    float gw2 = 0.0f;
+    float gb2 = 0.0f;
+    for (int b = 0; b < batch_size; ++b) {
+        float dz2 = d_dZ2[b * L2_DIM + k];
+        gw2 += dz2 * d_H1[b * L1_DIM + j];
+        if (j == 0) gb2 += dz2;
+    }
+    d_grad_w2[k * L1_DIM + j] = gw2;
+    if (j == 0) d_grad_b2[k] = gb2;
+}
+
+__global__ void train_backward_l1_act_kernel(
+    const float* __restrict__ d_H1,
+    const float* __restrict__ d_w2,
+    const float* __restrict__ d_dZ2,
+    float* __restrict__ d_dZ1,
+    int batch_size)
+{
+    int j = blockIdx.x * blockDim.x + threadIdx.x; // 0..511
+    int b = blockIdx.y;
+    if (b >= batch_size || j >= L1_DIM) return;
+
+    // Protect material/positional anchor L1 neurons 0..4
+    if (j < 5 || d_H1[b * L1_DIM + j] <= 0.0f) {
+        d_dZ1[b * L1_DIM + j] = 0.0f;
+        return;
+    }
+
+    float dh1 = 0.0f;
+    const float* dz2_b = d_dZ2 + b * L2_DIM;
+    #pragma unroll 8
+    for (int k = 2; k < L2_DIM; ++k) {
+        dh1 += dz2_b[k] * d_w2[k * L1_DIM + j];
+    }
+    d_dZ1[b * L1_DIM + j] = dh1;
+}
+
+__global__ void train_backward_l1_weights_kernel(
+    const float* __restrict__ d_X,
+    const float* __restrict__ d_dZ1,
+    float* __restrict__ d_grad_w1,
+    float* __restrict__ d_grad_b1,
+    int batch_size)
+{
+    int i = blockIdx.x * blockDim.x + threadIdx.x; // 0..362
+    int j = blockIdx.y;                            // 0..511
+    if (j >= L1_DIM || i >= IN_DIM) return;
+
+    if (j < 5) {
+        d_grad_w1[j * IN_DIM + i] = 0.0f;
+        if (i == 0) d_grad_b1[j] = 0.0f;
+        return;
+    }
+
+    float gw1 = 0.0f;
+    float gb1 = 0.0f;
+    for (int b = 0; b < batch_size; ++b) {
+        float dz1 = d_dZ1[b * L1_DIM + j];
+        gw1 += dz1 * d_X[b * IN_DIM + i];
+        if (i == 0) gb1 += dz1;
+    }
+    d_grad_w1[j * IN_DIM + i] = gw1;
+    if (i == 0) d_grad_b1[j] = gb1;
+}
+
+__global__ void adamw_update_kernel(
+    float* __restrict__ d_w,
+    const float* __restrict__ d_w_init,
+    const float* __restrict__ d_grad,
+    float* __restrict__ d_m,
+    float* __restrict__ d_v,
+    int n,
+    float lr,
+    float l2_reg,
+    float beta1,
+    float beta2,
+    float inv_bc1,
+    float inv_bc2,
+    float max_step)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n) return;
+
+    float g = d_grad[idx] + l2_reg * (d_w[idx] - d_w_init[idx]);
+    float m = beta1 * d_m[idx] + (1.0f - beta1) * g;
+    float v = beta2 * d_v[idx] + (1.0f - beta2) * g * g;
+    d_m[idx] = m;
+    d_v[idx] = v;
+
+    float m_hat = m * inv_bc1;
+    float v_hat = v * inv_bc2;
+    float step = lr * m_hat / (sqrtf(v_hat) + 1e-8f);
+    step = fminf(fmaxf(step, -max_step), max_step);
+    d_w[idx] -= step;
+}
+
+bool NeuralGPU::train_on_gpu(
+    const std::vector<TrainingSample>& samples,
+    int epochs,
+    float lr,
+    float policy_lr,
+    float l2_reg,
+    float max_output_delta,
+    int batch_size)
+{
+    int N = static_cast<int>(samples.size());
+    if (N <= 0) return false;
+
+    if (!initialized_ || contexts_.empty()) {
+        if (!init(device_id_, DEFAULT_MAX_BATCH)) return false;
+    }
+
+    int dev_id = contexts_[0]->device_id;
+    CUDA_CHECK(cudaSetDevice(dev_id));
+
+    // 1. Parallel CPU feature extraction using exact C++ Giraffe::extract_features
+    std::vector<float> h_X(static_cast<size_t>(N) * IN_DIM, 0.0f);
+    std::vector<float> h_Y(N, 0.0f);
+    std::vector<int> h_pol_idx(N, -1);
+    std::vector<float> h_pol_weight(N, 0.0f);
+
+    unsigned int num_threads = std::max(1u, std::thread::hardware_concurrency());
+    std::vector<std::future<void>> feat_futures;
+    int chunk = (N + static_cast<int>(num_threads) - 1) / static_cast<int>(num_threads);
+    for (unsigned int t = 0; t < num_threads; ++t) {
+        int start = static_cast<int>(t) * chunk;
+        if (start >= N) break;
+        int end = std::min(N, start + chunk);
+        feat_futures.push_back(std::async(std::launch::async, [&, start, end]() {
+            Board brd;
+            for (int i = start; i < end; ++i) {
+                brd.set_fen(samples[i].fen);
+                Giraffe::extract_features(brd, &h_X[static_cast<size_t>(i) * IN_DIM]);
+                h_Y[i] = samples[i].target_val;
+                h_pol_idx[i] = samples[i].move_pol_idx;
+                h_pol_weight[i] = samples[i].move_weight;
+            }
+        }));
+    }
+    for (auto& f : feat_futures) f.get();
+
+    // 2. Save initial weights for trust-region anchor regularization and delta clipping
+    std::vector<float> init_w1 = h_w1_;
+    std::vector<float> init_b1 = h_b1_;
+    std::vector<float> init_w2 = h_w2_;
+    std::vector<float> init_b2 = h_b2_;
+    std::vector<float> init_w3 = h_w3_;
+    std::vector<float> init_b3 = h_b3_;
+    std::vector<float> init_w_pol = h_w_pol_;
+    std::vector<float> init_b_pol = h_b_pol_;
+
+    // 3. Allocate GPU training buffers
+    int B = std::min(batch_size, N);
+    float *d_X_batch = nullptr, *d_Y_batch = nullptr, *d_pol_w_batch = nullptr;
+    int *d_pol_idx_batch = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_X_batch, B * IN_DIM * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_Y_batch, B * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_pol_idx_batch, B * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_pol_w_batch, B * sizeof(float)));
+
+    float *d_H1 = nullptr, *d_H2 = nullptr, *d_preds = nullptr;
+    float *d_dZ3 = nullptr, *d_dH2 = nullptr, *d_dZ2 = nullptr, *d_dZ1 = nullptr;
+    CUDA_CHECK(cudaMalloc(&d_H1, B * L1_DIM * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_H2, B * L2_DIM * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_preds, B * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_dZ3, B * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_dH2, B * L2_DIM * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_dZ2, B * L2_DIM * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_dZ1, B * L1_DIM * sizeof(float)));
+
+    // Device weights, initial weights, gradients, and AdamW moments (m, v)
+    auto alloc_param = [](size_t count, const std::vector<float>& host_init,
+                          float** d_w, float** d_init, float** d_g, float** d_m, float** d_v) {
+        size_t bytes = count * sizeof(float);
+        CUDA_CHECK(cudaMalloc(d_w, bytes));
+        CUDA_CHECK(cudaMalloc(d_init, bytes));
+        CUDA_CHECK(cudaMalloc(d_g, bytes));
+        CUDA_CHECK(cudaMalloc(d_m, bytes));
+        CUDA_CHECK(cudaMalloc(d_v, bytes));
+        CUDA_CHECK(cudaMemcpy(*d_w, host_init.data(), bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(*d_init, host_init.data(), bytes, cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemset(*d_g, 0, bytes));
+        CUDA_CHECK(cudaMemset(*d_m, 0, bytes));
+        CUDA_CHECK(cudaMemset(*d_v, 0, bytes));
+    };
+
+    float *dw1, *di_w1, *dg_w1, *dm_w1, *dv_w1;
+    float *db1, *di_b1, *dg_b1, *dm_b1, *dv_b1;
+    float *dw2, *di_w2, *dg_w2, *dm_w2, *dv_w2;
+    float *db2, *di_b2, *dg_b2, *dm_b2, *dv_b2;
+    float *dw3, *di_w3, *dg_w3, *dm_w3, *dv_w3;
+    float *db3, *di_b3, *dg_b3, *dm_b3, *dv_b3;
+    float *dwp, *di_wp, *dg_wp, *dm_wp, *dv_wp;
+    float *dbp, *di_bp, *dg_bp, *dm_bp, *dv_bp;
+
+    alloc_param(h_w1_.size(), h_w1_, &dw1, &di_w1, &dg_w1, &dm_w1, &dv_w1);
+    alloc_param(h_b1_.size(), h_b1_, &db1, &di_b1, &dg_b1, &dm_b1, &dv_b1);
+    alloc_param(h_w2_.size(), h_w2_, &dw2, &di_w2, &dg_w2, &dm_w2, &dv_w2);
+    alloc_param(h_b2_.size(), h_b2_, &db2, &di_b2, &dg_b2, &dm_b2, &dv_b2);
+    alloc_param(h_w3_.size(), h_w3_, &dw3, &di_w3, &dg_w3, &dm_w3, &dv_w3);
+    alloc_param(h_b3_.size(), h_b3_, &db3, &di_b3, &dg_b3, &dm_b3, &dv_b3);
+    alloc_param(h_w_pol_.size(), h_w_pol_, &dwp, &di_wp, &dg_wp, &dm_wp, &dv_wp);
+    alloc_param(h_b_pol_.size(), h_b_pol_, &dbp, &di_bp, &dg_bp, &dm_bp, &dv_bp);
+
+    // Compute baseline predictions across all N samples before training
+    auto eval_all_samples = [&](std::vector<float>& out_preds) {
+        out_preds.resize(N);
+        for (int start = 0; start < N; start += B) {
+            int cur_B = std::min(B, N - start);
+            CUDA_CHECK(cudaMemcpy(d_X_batch, &h_X[static_cast<size_t>(start) * IN_DIM], cur_B * IN_DIM * sizeof(float), cudaMemcpyHostToDevice));
+            dim3 grid_l1((L1_DIM + 255) / 256, cur_B);
+            forward_l1_kernel<<<grid_l1, 256>>>(d_X_batch, dw1, db1, d_H1, cur_B);
+            train_forward_l2_kernel<<<cur_B, L2_DIM>>>(d_H1, dw2, db2, d_H2, cur_B);
+            train_forward_val_grad_kernel<<<cur_B, L2_DIM>>>(d_H2, dw3, db3, nullptr, d_preds, nullptr, nullptr, cur_B);
+            CUDA_CHECK(cudaMemcpy(&out_preds[start], d_preds, cur_B * sizeof(float), cudaMemcpyDeviceToHost));
+        }
+    };
+
+    std::vector<float> orig_preds;
+    eval_all_samples(orig_preds);
+    double initial_loss = 0.0;
+    for (int i = 0; i < N; ++i) {
+        double d = orig_preds[i] - h_Y[i];
+        initial_loss += d * d;
+    }
+    initial_loss /= N;
+    std::cout << "Initial Value Loss (MSE): " << initial_loss << std::endl;
+
+    // 4. Mini-batch SGD / AdamW training loop on GPU
+    std::vector<int> indices(N);
+    for (int i = 0; i < N; ++i) indices[i] = i;
+    std::mt19937 rng(42);
+
+    std::vector<float> batch_X(B * IN_DIM);
+    std::vector<float> batch_Y(B);
+    std::vector<int> batch_pol_idx(B);
+    std::vector<float> batch_pol_w(B);
+
+    const float beta1 = 0.9f;
+    const float beta2 = 0.999f;
+    int step_count = 0;
+
+    for (int ep = 0; ep < epochs; ++ep) {
+        std::shuffle(indices.begin(), indices.end(), rng);
+
+        for (int start = 0; start < N; start += B) {
+            int cur_B = std::min(B, N - start);
+            step_count++;
+
+            for (int b = 0; b < cur_B; ++b) {
+                int idx = indices[start + b];
+                std::memcpy(&batch_X[b * IN_DIM], &h_X[static_cast<size_t>(idx) * IN_DIM], IN_DIM * sizeof(float));
+                batch_Y[b] = h_Y[idx];
+                batch_pol_idx[b] = h_pol_idx[idx];
+                batch_pol_w[b] = h_pol_weight[idx];
+            }
+
+            CUDA_CHECK(cudaMemcpy(d_X_batch, batch_X.data(), cur_B * IN_DIM * sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_Y_batch, batch_Y.data(), cur_B * sizeof(float), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_pol_idx_batch, batch_pol_idx.data(), cur_B * sizeof(int), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_pol_w_batch, batch_pol_w.data(), cur_B * sizeof(float), cudaMemcpyHostToDevice));
+
+            // Forward pass (L1 -> L2 -> Value Head + dH2 init)
+            dim3 grid_l1((L1_DIM + 255) / 256, cur_B);
+            forward_l1_kernel<<<grid_l1, 256>>>(d_X_batch, dw1, db1, d_H1, cur_B);
+            train_forward_l2_kernel<<<cur_B, L2_DIM>>>(d_H1, dw2, db2, d_H2, cur_B);
+            train_forward_val_grad_kernel<<<cur_B, L2_DIM>>>(d_H2, dw3, db3, d_Y_batch, d_preds, d_dZ3, d_dH2, cur_B);
+            train_val_weight_grad_kernel<<<1, L2_DIM>>>(d_H2, d_dZ3, dg_w3, dg_b3, cur_B);
+
+            // Policy Head forward + backward pass
+            if (policy_lr > 0.0f) {
+                CUDA_CHECK(cudaMemset(dg_wp, 0, h_w_pol_.size() * sizeof(float)));
+                CUDA_CHECK(cudaMemset(dg_bp, 0, h_b_pol_.size() * sizeof(float)));
+                train_policy_forward_backward_kernel<<<cur_B, 256>>>(
+                    d_H2, dwp, dbp, d_pol_idx_batch, d_pol_w_batch, dg_wp, dg_bp, d_dH2, cur_B);
+            }
+
+            // Backward pass through Layer 2 and Layer 1
+            train_backward_l2_act_kernel<<<cur_B, L2_DIM>>>(d_H2, d_dH2, d_dZ2, cur_B);
+            dim3 grid_w2(L1_DIM / 32, L2_DIM);
+            train_backward_l2_weights_kernel<<<grid_w2, 32>>>(d_H1, d_dZ2, dg_w2, dg_b2, cur_B);
+
+            dim3 grid_dz1(L1_DIM / 64, cur_B);
+            train_backward_l1_act_kernel<<<grid_dz1, 64>>>(d_H1, dw2, d_dZ2, d_dZ1, cur_B);
+
+            dim3 grid_w1((IN_DIM + 31) / 32, L1_DIM);
+            train_backward_l1_weights_kernel<<<grid_w1, 32>>>(d_X_batch, d_dZ1, dg_w1, dg_b1, cur_B);
+
+            // AdamW bias correction factors
+            float inv_bc1 = 1.0f / (1.0f - std::pow(beta1, static_cast<float>(step_count)));
+            float inv_bc2 = 1.0f / (1.0f - std::pow(beta2, static_cast<float>(step_count)));
+
+            auto launch_adamw = [&](float* w, const float* w_init, const float* g, float* m, float* v,
+                                    int count, float layer_lr, float max_step) {
+                int blocks = (count + 255) / 256;
+                adamw_update_kernel<<<blocks, 256>>>(
+                    w, w_init, g, m, v, count, layer_lr, l2_reg, beta1, beta2, inv_bc1, inv_bc2, max_step);
+            };
+
+            // Layer-wise learning rates: full trunk + value head + policy head
+            launch_adamw(dw1, di_w1, dg_w1, dm_w1, dv_w1, static_cast<int>(h_w1_.size()), lr * 0.25f, 0.002f);
+            launch_adamw(db1, di_b1, dg_b1, dm_b1, dv_b1, static_cast<int>(h_b1_.size()), lr * 0.25f, 0.002f);
+            launch_adamw(dw2, di_w2, dg_w2, dm_w2, dv_w2, static_cast<int>(h_w2_.size()), lr * 0.50f, 0.003f);
+            launch_adamw(db2, di_b2, dg_b2, dm_b2, dv_b2, static_cast<int>(h_b2_.size()), lr * 0.50f, 0.003f);
+            launch_adamw(dw3, di_w3, dg_w3, dm_w3, dv_w3, static_cast<int>(h_w3_.size()), lr, 0.004f);
+            launch_adamw(db3, di_b3, dg_b3, dm_b3, dv_b3, static_cast<int>(h_b3_.size()), lr * 0.50f, 0.002f);
+
+            if (policy_lr > 0.0f) {
+                launch_adamw(dwp, di_wp, dg_wp, dm_wp, dv_wp, static_cast<int>(h_w_pol_.size()), policy_lr, 0.005f);
+                launch_adamw(dbp, di_bp, dg_bp, dm_bp, dv_bp, static_cast<int>(h_b_pol_.size()), policy_lr, 0.005f);
+            }
+        }
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    // Copy trained weights back to host
+    CUDA_CHECK(cudaMemcpy(h_w1_.data(), dw1, h_w1_.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_b1_.data(), db1, h_b1_.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_w2_.data(), dw2, h_w2_.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_b2_.data(), db2, h_b2_.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_w3_.data(), dw3, h_w3_.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_b3_.data(), db3, h_b3_.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_w_pol_.data(), dwp, h_w_pol_.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(h_b_pol_.data(), dbp, h_b_pol_.size() * sizeof(float), cudaMemcpyDeviceToHost));
+    h_b3_[0] = std::max(-0.08f, std::min(0.08f, h_b3_[0]));
+    CUDA_CHECK(cudaMemcpy(db3, h_b3_.data(), h_b3_.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+    // 5. Trust-region check & interpolation if max output delta exceeds max_output_delta
+    std::vector<float> new_preds;
+    eval_all_samples(new_preds);
+
+    float max_diff = 0.0f;
+    double sum_diff = 0.0;
+    for (int i = 0; i < N; ++i) {
+        float d = std::abs(new_preds[i] - orig_preds[i]);
+        if (d > max_diff) max_diff = d;
+        sum_diff += d;
+    }
+
+    if (max_diff > max_output_delta && max_diff > 1e-6f) {
+        float scale = max_output_delta / max_diff;
+        for (int iter = 0; iter < 8; ++iter) {
+            auto blend = [&](std::vector<float>& cur, const std::vector<float>& init_v, float* d_dst) {
+                for (size_t i = 0; i < cur.size(); ++i) {
+                    cur[i] = init_v[i] + scale * (cur[i] - init_v[i]);
+                }
+                CUDA_CHECK(cudaMemcpy(d_dst, cur.data(), cur.size() * sizeof(float), cudaMemcpyHostToDevice));
+            };
+            blend(h_w1_, init_w1, dw1);
+            blend(h_b1_, init_b1, db1);
+            blend(h_w2_, init_w2, dw2);
+            blend(h_b2_, init_b2, db2);
+            blend(h_w3_, init_w3, dw3);
+            blend(h_b3_, init_b3, db3);
+
+            eval_all_samples(new_preds);
+            max_diff = 0.0f;
+            sum_diff = 0.0;
+            for (int i = 0; i < N; ++i) {
+                float d = std::abs(new_preds[i] - orig_preds[i]);
+                if (d > max_diff) max_diff = d;
+                sum_diff += d;
+            }
+            if (max_diff <= max_output_delta) break;
+            scale = 0.85f * (max_output_delta / max_diff);
+        }
+        std::cout << "Trust-region clipped max output delta to " << max_diff
+                  << " (" << (max_diff * 1000.0f) << " cp)" << std::endl;
+    }
+
+    double final_loss = 0.0;
+    for (int i = 0; i < N; ++i) {
+        double d = new_preds[i] - h_Y[i];
+        final_loss += d * d;
+    }
+    final_loss /= N;
+    double mean_diff = sum_diff / N;
+
+    std::cout << "Final Value Loss (MSE):   " << final_loss
+              << " | Mean Eval Shift: " << (mean_diff * 1000.0)
+              << " cp | Max Shift: " << (max_diff * 1000.0f) << " cp" << std::endl;
+
+    // Free training device buffers
+    cudaFree(d_X_batch); cudaFree(d_Y_batch); cudaFree(d_pol_idx_batch); cudaFree(d_pol_w_batch);
+    cudaFree(d_H1); cudaFree(d_H2); cudaFree(d_preds);
+    cudaFree(d_dZ3); cudaFree(d_dH2); cudaFree(d_dZ2); cudaFree(d_dZ1);
+
+    auto free_param = [](float* w, float* init_p, float* g, float* m, float* v) {
+        cudaFree(w); cudaFree(init_p); cudaFree(g); cudaFree(m); cudaFree(v);
+    };
+    free_param(dw1, di_w1, dg_w1, dm_w1, dv_w1);
+    free_param(db1, di_b1, dg_b1, dm_b1, dv_b1);
+    free_param(dw2, di_w2, dg_w2, dm_w2, dv_w2);
+    free_param(db2, di_b2, dg_b2, dm_b2, dv_b2);
+    free_param(dw3, di_w3, dg_w3, dm_w3, dv_w3);
+    free_param(db3, di_b3, dg_b3, dm_b3, dv_b3);
+    free_param(dwp, di_wp, dg_wp, dm_wp, dv_wp);
+    free_param(dbp, di_bp, dg_bp, dm_bp, dv_bp);
+
+    // Broadcast updated weights to all active GPU stream contexts
+    for (auto& ctx : contexts_) {
+        ctx->copy_weights(h_w1_, h_b1_, h_w2_, h_b2_, h_w3_, h_b3_, h_w_pol_, h_b_pol_);
+    }
+
+    return true;
 }
 
 } // namespace Neural

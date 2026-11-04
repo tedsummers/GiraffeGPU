@@ -103,7 +103,7 @@ class AutonomousPipeline:
             "--games", str(games_count),
             "--movetime", str(movetime),
             "--random-plies", "8",
-            "--engine-options", "PolicyNet=false"
+            "--engine-options", "PolicyNet=true"
         ]
         subprocess.run(cmd, cwd=REPO_DIR)
         self.state["total_selfplay_games"] += games_count
@@ -114,15 +114,16 @@ class AutonomousPipeline:
         candidate_weights = os.path.join(RESULTS_DIR, "candidate.net")
         active_weights = os.path.join(REPO_DIR, "eval.net")
 
-        epochs = 2 if self.quick_test else 5
+        epochs = 2 if self.quick_test else 10
         cmd = [
             sys.executable, os.path.join(TESTING_DIR, "train_weights.py"),
             "--data", dataset_path,
             "--in-weights", active_weights,
             "--out-weights", candidate_weights,
             "--epochs", str(epochs),
-            "--lr", "0.00025",
-            "--max-output-delta", "0.02",
+            "--lr", "0.0005",
+            "--policy-lr", "0.001",
+            "--max-output-delta", "0.05",
             "--seed", "1337"
         ]
         subprocess.run(cmd, cwd=REPO_DIR)
@@ -140,7 +141,7 @@ class AutonomousPipeline:
         if os.path.exists(search_options_path):
             with open(search_options_path, "r") as f:
                 search_options = f.read().strip()
-        common_options = "PolicyNet=false"
+        common_options = "PolicyNet=true"
         if search_options:
             common_options += "," + search_options
         candidate_options = f"WeightsFile={candidate_weights},{common_options}"
