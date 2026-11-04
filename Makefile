@@ -1,4 +1,5 @@
-NVCC ?= /opt/cuda/bin/nvcc
+CUDA_PATH ?= $(shell if [ -d /opt/cuda ]; then echo /opt/cuda; elif [ -d /usr/local/cuda ]; then echo /usr/local/cuda; else echo /opt/cuda; fi)
+NVCC ?= $(CUDA_PATH)/bin/nvcc
 CXX ?= g++
 
 TARGET = GiraffeGPU
@@ -15,14 +16,14 @@ C_OBJS   = $(patsubst $(SRC_DIR)/syzygy/%.c, $(OBJ_DIR)/syzygy/%.o, $(C_SRCS))
 CU_OBJS  = $(patsubst $(SRC_DIR)/cuda/%.cu, $(OBJ_DIR)/cuda/%.o, $(CU_SRCS))
 
 CFLAGS   = -O3 -march=native -MMD -MP -Wall -Wextra -pthread -I$(SRC_DIR)
-CXXFLAGS = -O3 -march=native -MMD -MP -std=c++17 -Wall -Wextra -pthread -I$(SRC_DIR) -I/opt/cuda/include
-NVCCFLAGS = -O3 -std=c++17 -I$(SRC_DIR) -I/opt/cuda/include \
+CXXFLAGS = -O3 -march=native -MMD -MP -std=c++17 -Wall -Wextra -pthread -I$(SRC_DIR) -I$(CUDA_PATH)/include
+NVCCFLAGS = -O3 -std=c++17 -I$(SRC_DIR) -I$(CUDA_PATH)/include \
             -gencode arch=compute_86,code=sm_86 \
             -gencode arch=compute_120,code=sm_120 \
             -gencode arch=compute_86,code=compute_86 \
             --compiler-options "-O3 -march=native -Wall"
 
-LDFLAGS = -L/opt/cuda/lib64 -lcudart -lpthread
+LDFLAGS = -L$(CUDA_PATH)/lib64 -lcudart -lpthread
 
 all: $(TARGET)
 
@@ -75,6 +76,9 @@ test-tactics:
 test-selfplay:
 	python3 testing/run_tests.py --selfplay --games 5 --movetime 50
 
+train:
+	python3 testing/train_weights.py --data testing/results/selfplay_dataset.jsonl --in-weights eval.net --out-weights eval.net --epochs 10 --lr 0.0005 --policy-lr 0.001 --max-output-delta 0.05
+
 autonomous-5day:
 	python3 testing/autonomous_5day.py --start
 
@@ -86,4 +90,4 @@ autonomous-status:
 
 -include $(CPP_OBJS:.o=.d) $(C_OBJS:.o=.d)
 
-.PHONY: all clean windows windows-cuda test-epd test-tactics test-selfplay autonomous-5day autonomous-daemon autonomous-status
+.PHONY: all clean windows windows-cuda test-epd test-tactics test-selfplay train autonomous-5day autonomous-daemon autonomous-status
