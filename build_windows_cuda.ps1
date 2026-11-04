@@ -14,14 +14,25 @@ $cppSources = Get-ChildItem (Join-Path $sourceDir "*.cpp") |
     ForEach-Object { $_.FullName }
 $cudaSources = Get-ChildItem (Join-Path $sourceDir "cuda\*.cu") |
     ForEach-Object { $_.FullName }
-$cSources = Get-ChildItem (Join-Path $sourceDir "syzygy\*.c") |
-    ForEach-Object { $_.FullName }
+$cSources = @(Join-Path $sourceDir "syzygy\tbprobe.c")
 
 $output = Join-Path $root "GiraffeGPU_cuda.exe"
-$arch = if ($env:GIRAFFE_CUDA_ARCH) { $env:GIRAFFE_CUDA_ARCH } else { "sm_86" }
 
-Write-Host "Building native Windows CUDA engine ($arch)..."
-& nvcc -ccbin cl -O3 -std=c++17 -arch=$arch -I$sourceDir `
+if ($env:GIRAFFE_CUDA_ARCH) {
+    $gencodeFlags = @("-arch=$($env:GIRAFFE_CUDA_ARCH)")
+    Write-Host "Building native Windows CUDA engine ($($env:GIRAFFE_CUDA_ARCH))..."
+} else {
+    $gencodeFlags = @(
+        "-gencode", "arch=compute_86,code=sm_86",
+        "-gencode", "arch=compute_120,code=sm_120",
+        "-gencode", "arch=compute_86,code=compute_86"
+    )
+    Write-Host "Building native Windows Dual/Multi-GPU CUDA engine (sm_86 + sm_120 + PTX)..."
+}
+
+& nvcc -ccbin cl -O3 -std=c++17 @gencodeFlags -I$sourceDir `
+    -DNOMINMAX -DWIN32_LEAN_AND_MEAN `
+    -Xcompiler "/O2 /EHsc /utf-8" `
     --machine 64 --allow-unsupported-compiler `
     $cppSources $cudaSources $cSources -o $output
 
