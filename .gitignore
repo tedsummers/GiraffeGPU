@@ -1,7 +1,6 @@
 # Build artifacts
 obj/
 build/
-GiraffeGPU
 *.pdb
 *.o
 *.d
