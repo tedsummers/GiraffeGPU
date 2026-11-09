@@ -297,27 +297,31 @@ python3 testing/run_tests.py --compare-policy --games 20 --tc 60+0.5
 python3 testing/run_tests.py --compare-policy --sprt --elo0 0.0 --elo1 15.0 --games 100 --tc 60+0.5
 ```
 - Real-time scoreboard with **Elo difference**, **95% confidence error margins ($\pm$)**, **Likelihood of Superiority (LOS %)**, and **Log-Likelihood Ratio (LLR)**.
+- Runs **2 concurrent match games (`--concurrency 2`)** by default across dual GPUs (`Threads=2` per engine instance), cutting match duration in half.
+- Uses a **Two-Tier Promotion Gate**: accepts candidates either on early SPRT stop (`LLR >= +2.94`) or at full match completion when `LOS >= 80.0%` (`wins > losses`).
 - Supports custom UCI engine parameters via `--engine1-options` and `--engine2-options` (e.g. `PolicyNet=true`, `WeightsFile=candidate.net`).
 - Saves full game transcripts to `testing/results/match_<timestamp>.pgn`.
 
-### 3. Dual-GPU Parallel Self-Play & Reinforcement Learning Data Generator
-Generates self-play games concurrently across both NVIDIA GPUs (`--workers 2` by default, pinning Worker 0 to `Device_GPU=0` and Worker 1 to `Device_GPU=1`) with randomized opening plies (as in Matthew Lai's Giraffe paper) to produce datasets for TD-learning and neural fine-tuning:
+### 3. Dual-GPU Parallel Self-Play & Stockfish Teacher Distillation
+Generates self-play games concurrently across both NVIDIA GPUs (`--workers 2` by default, pinning Worker 0 to `Device_GPU=0` and Worker 1 to `Device_GPU=1`) with randomized opening plies (as in Matthew Lai's Giraffe paper), and automatically labels each visited position using a depth-10 **Stockfish teacher probe** (`/usr/local/bin/stockfish` when present, or disable via `--no-teacher`):
 
 ```bash
-# Generate 50 self-play games concurrently across both GPUs:
+# Generate 50 self-play games concurrently across both GPUs with Stockfish teacher distillation:
 python3 testing/self_play.py --games 50 --movetime 80 --workers 2
-# or via test runner:
-python3 testing/run_tests.py --selfplay --games 50 --movetime 100
+# Pure self-play without teacher distillation:
+python3 testing/self_play.py --games 50 --movetime 80 --workers 2 --no-teacher
 # or quick run:
 make test-selfplay
 ```
-- Saves position FENs, candidate moves, evaluations, search depths, and game outcomes directly to `testing/results/selfplay_dataset.jsonl`.
+- Saves position FENs, played moves, teacher best moves (`bestmove`), evaluations (`eval_cp`), search depths, and game outcomes directly to `testing/results/selfplay_dataset.jsonl`.
 
 ### 4. Native CUDA Full-Network Weight Trainer (`train_weights.py` & `./GiraffeGPU train`)
 Trains and fine-tunes the entire Dual-Head network (`w1, b1, w2, b2, w3, b3, w_pol, b_pol`) on the GPU using custom CUDA forward/backward and AdamW kernels:
 
 ```bash
 # Fine-tune full network (Value + Policy heads) on GPU from self-play data:
+make train
+# or:
 python3 testing/run_tests.py --train --epochs 10
 
 # Or invoke the trainer directly with custom weight paths:
@@ -325,6 +329,7 @@ python3 testing/train_weights.py --data testing/results/selfplay_dataset.jsonl \
   --in-weights eval.net --out-weights testing/results/candidate.net \
   --epochs 10 --lr 0.0005 --max-output-delta 0.05 --policy-lr 0.001
 ```
+- Uses a **Recency-Weighted Replay Buffer** (sampling **70%** from the newest positions played by the latest network + teacher labels and **30%** from older historical positions to prevent forgetting).
 - Extracts 363-dimensional features in parallel across all CPU threads via C++ `Giraffe::extract_features` (ensuring bit-for-bit identical features between engine search and training) and executes full-network AdamW backpropagation on CUDA.
 - Protects material/positional anchor neurons (`0..4` in $L_1$, `0..1` in $L_2$) while training all remaining hidden neurons and the 4096-move policy head.
 - Enforces trust-region output delta clipping (`--max-output-delta`) and preserves compatibility with both `GIRAFDUAL` and legacy `GIRAFGPU` weight files (with automatic CPU/NumPy fallback via `--no-gpu`).
@@ -366,12 +371,12 @@ flowchart TD
 
 | Day | Focus Area | What the Daemon Executes | Expected Elo Gain |
 | :--- | :--- | :--- | :--- |
-| **Day 1** | **Search Parameter Optimization (SPSA)** | Automated tuning of search heuristics using `tune_spsa.py` (`5` iterations $\times$ `6` games per cycle at `60+0.5`): Late Move Reductions (LMR), Null-Move $R$ margins, Aspiration Window size, and ProbCut margins. | **Measured by SPSA** |
-| **Day 2** | **Tactical Distillation & Opening Tuning** | Self-play generation (50 games/cycle), FEN-aware value fine-tuning, and 40-game SPRT verification matches at `60+0.5` (~2 hrs/cycle). | **Measured by SPRT** |
-| **Day 3** | **Large-Scale Dual-GPU Self-Play** | Continuous dual-GPU self-play starting from randomized opening positions (`testing/books/openings.epd`) with SPRT gating at `60+0.5`. | **Measured by SPRT** |
-| **Day 4** | **FEN-Aware Value Training** | Train the value output layer using blended white-perspective search and game-result targets, with an 80/20 validation split and `60+0.5` SPRT matches. | **Measured by SPRT** |
+| **Day 1** | **Search Parameter Optimization (SPSA)** | Automated tuning of search heuristics using `tune_spsa.py` (`5` iterations $\times$ `6` games per cycle at `60+0.5`, `--concurrency 2`): Late Move Reductions (LMR), Null-Move $R$ margins, Aspiration Window size, and ProbCut margins. | **Measured by SPSA** |
+| **Day 2** | **Tactical Distillation & Opening Tuning** | Dual-GPU self-play with Stockfish teacher distillation (50 games/cycle), 70/30 recency-weighted CUDA full-network training, and 40-game SPRT matches at `60+0.5` (`--concurrency 2`, ~1 hr/cycle). | **Measured by SPRT/LOS** |
+| **Day 3** | **Large-Scale Dual-GPU Self-Play** | Continuous dual-GPU self-play starting from randomized opening positions (`testing/books/openings.epd`) with SPRT / `LOS >= 80%` gating at `60+0.5`. | **Measured by SPRT/LOS** |
+| **Day 4** | **Full-Network Value & Policy Training** | Train all layers (`w1, w2, w3, w_pol`) on GPU using blended game outcomes and teacher evaluations, gated by `60+0.5` SPRT matches. | **Measured by SPRT/LOS** |
 | **Day 5** | **Validation & Packaging** | Run final self-play, Bratko-Kopec (`bk.epd`) & tactical (`tactics.epd`) benchmarks, and package updated binaries (`GiraffeGPU` and `GiraffeGPU.exe`). | **Measured by EPD/SPRT** |
-| **Total** | **120 Hours (5 Days)** | **~55–65 Full Cycles at `60+0.5` (1 min + 0.5s/move)** | **Statistically Gated** |
+| **Total** | **120 Hours (5 Days)** | **~100–120 Full Cycles at `60+0.5` (`--concurrency 2` across Dual GPUs)** | **Statistically Gated** |
 
 #### Commands to Run and Monitor
 
