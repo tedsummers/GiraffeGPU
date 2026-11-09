@@ -140,7 +140,7 @@ class SPSATuner:
             tc=self.tc,
             book_path=os.path.join(os.path.dirname(os.path.dirname(self.engine_path)),
                                    "testing", "books", "openings.epd"),
-            concurrency=1,
+            concurrency=2,
             engine1_options=self.option_string(theta_plus),
             engine2_options=self.option_string(theta_minus),
         )

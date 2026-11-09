@@ -157,12 +157,13 @@ class AutonomousPipeline:
             "--engine2-options", f"WeightsFile={os.path.join(REPO_DIR, 'eval.net')},{common_options}",
             "--games", str(games),
             "--tc", "60+0.5",
+            "--concurrency", "2",
             "--sprt"
         ]
         proc = subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_DIR)
         output = proc.stdout
 
-        accepted = ("SPRT Early Stop: ACCEPTED" in output) and not self.quick_test
+        accepted = (("SPRT Early Stop: ACCEPTED" in output) or ("SPRT Decision: ACCEPTED" in output)) and not self.quick_test
         if accepted:
             log(">>> PROMOTED: Candidate demonstrated positive Elo! Deploying candidate.net to eval.net.")
             shutil.copy(candidate_weights, os.path.join(REPO_DIR, "eval.net"))

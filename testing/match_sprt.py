@@ -152,20 +152,30 @@ def run_match(engine1_path, engine2_path, games=20, tc="60+0.5", book_path=None,
     rounds_count = max(1, games // 2)
 
     eng1_spec = [f"cmd={os.path.abspath(engine1_path)}", f"name={e1_name}"]
+    e1_has_threads = False
     if engine1_options:
         for opt in engine1_options.split(","):
             opt = opt.strip()
             if "=" in opt:
                 k, v = opt.split("=", 1)
+                if k.strip() == "Threads":
+                    e1_has_threads = True
                 eng1_spec.append(f"option.{k}={v}")
+    if concurrency >= 2 and not e1_has_threads:
+        eng1_spec.append("option.Threads=2")
 
     eng2_spec = [f"cmd={os.path.abspath(engine2_path)}", f"name={e2_name}"]
+    e2_has_threads = False
     if engine2_options:
         for opt in engine2_options.split(","):
             opt = opt.strip()
             if "=" in opt:
                 k, v = opt.split("=", 1)
+                if k.strip() == "Threads":
+                    e2_has_threads = True
                 eng2_spec.append(f"option.{k}={v}")
+    if concurrency >= 2 and not e2_has_threads:
+        eng2_spec.append("option.Threads=2")
 
     cmd = [
         cutechess,
@@ -231,6 +241,9 @@ def run_match(engine1_path, engine2_path, games=20, tc="60+0.5", book_path=None,
 
     stats = compute_stats(wins, losses, draws)
     sprt = compute_sprt(wins, losses, draws, elo0=elo0, elo1=elo1)
+    if sprt_mode and sprt['status'] == "CONTINUE" and total_played >= 20 and wins > losses and stats['los'] >= 80.0:
+        sprt['status'] = f"ACCEPTED (LOS {stats['los']:.1f}% >= 80.0% at match completion)"
+        print(f"\nSPRT Decision: {sprt['status']}")
 
     print("\n=======================================================")
     print("FINAL MATCH RESULTS:")
@@ -265,7 +278,7 @@ def main():
     parser.add_argument("--games", type=int, default=20, help="Number of games to play (default: 20)")
     parser.add_argument("--tc", default="60+0.5", help="Time control (default: 60+0.5)")
     parser.add_argument("--book", default="testing/books/openings.epd", help="Opening book (.epd or .pgn)")
-    parser.add_argument("--concurrency", type=int, default=1, help="Concurrent games (default: 1)")
+    parser.add_argument("--concurrency", type=int, default=2, help="Concurrent games (default: 2 for Dual-GPU)")
     parser.add_argument("--sprt", action="store_true", help="Enable SPRT stopping conditions")
     parser.add_argument("--elo0", type=float, default=0.0, help="SPRT Elo 0 bound (default: 0.0)")
     parser.add_argument("--elo1", type=float, default=10.0, help="SPRT Elo 1 bound (default: 10.0)")

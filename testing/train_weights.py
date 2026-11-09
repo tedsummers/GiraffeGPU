@@ -335,9 +335,19 @@ def train_on_dataset(data_path, in_weights_path, out_weights_path, epochs=3, lr=
 
     print(f"Loaded {len(samples)} training samples from {data_path}")
     random.seed(seed)
-    random.shuffle(samples)
     max_samples = min(len(samples), max_samples_limit)
-    samples = samples[:max_samples]
+    if len(samples) > max_samples:
+        # Recency-weighted replay buffer: 70% from the newest positions (played by the
+        # latest network + teacher distillation) and 30% from historical buffer.
+        recent_Quota = int(max_samples * 0.70)
+        hist_quota = max_samples - recent_Quota
+        recent_pool = samples[-recent_Quota:]
+        hist_pool = samples[:-recent_Quota]
+        if len(hist_pool) > hist_quota:
+            hist_pool = random.sample(hist_pool, hist_quota)
+        samples = recent_pool + hist_pool
+        print(f"Replay buffer selected {len(recent_pool)} recent + {len(hist_pool)} historical samples")
+    random.shuffle(samples)
 
     # Fast native CUDA GPU training path (uses C++ Giraffe::extract_features + CUDA AdamW across all layers)
     repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

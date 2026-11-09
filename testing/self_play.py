@@ -12,6 +12,7 @@ import random
 import subprocess
 import json
 import argparse
+import shutil
 import threading
 import queue
 from datetime import datetime
@@ -91,6 +92,11 @@ class UCIEngineInstance:
                     elif p == "cp" and i + 1 < len(parts):
                         try: score_cp = int(parts[i+1])
                         except: pass
+                    elif p == "mate" and i + 1 < len(parts):
+                        try:
+                            m_val = int(parts[i+1])
+                            score_cp = 2000 if m_val > 0 else -2000
+                        except: pass
             elif line.startswith("bestmove"):
                 parts = line.split()
                 if len(parts) >= 2:
@@ -98,6 +104,34 @@ class UCIEngineInstance:
                 break
 
         return best_move, score_cp, depth
+
+    def probe_depth(self, fen, target_depth=10):
+        self.send(f"position fen {fen}")
+        self.send(f"go depth {target_depth}")
+        best_move = None
+        score_cp = 0
+        while True:
+            line = self.process.stdout.readline()
+            if not line:
+                break
+            line = line.strip()
+            if line.startswith("info"):
+                parts = line.split()
+                for i, p in enumerate(parts):
+                    if p == "cp" and i + 1 < len(parts):
+                        try: score_cp = int(parts[i+1])
+                        except: pass
+                    elif p == "mate" and i + 1 < len(parts):
+                        try:
+                            m_val = int(parts[i+1])
+                            score_cp = 2000 if m_val > 0 else -2000
+                        except: pass
+            elif line.startswith("bestmove"):
+                parts = line.split()
+                if len(parts) >= 2:
+                    best_move = parts[1]
+                break
+        return best_move, score_cp
 
     def close(self):
         if self.process:
@@ -127,7 +161,7 @@ def get_random_opening(engine, plies=6):
         board.push(move)
     return moves
 
-def play_selfplay_game(engine_or_path, movetime=100, random_plies=6, max_moves=100, engine_options=None):
+def play_selfplay_game(engine_or_path, movetime=100, random_plies=6, max_moves=100, engine_options=None, teacher_engine=None):
     if chess is None:
         raise RuntimeError("python-chess is required for self-play dataset generation")
     owns_engine = isinstance(engine_or_path, str)
@@ -135,6 +169,10 @@ def play_selfplay_game(engine_or_path, movetime=100, random_plies=6, max_moves=1
     engine.send("ucinewgame")
     engine.send("isready")
     engine.wait_for("readyok")
+    if teacher_engine is not None:
+        teacher_engine.send("ucinewgame")
+        teacher_engine.send("isready")
+        teacher_engine.wait_for("readyok")
 
     moves_history = get_random_opening(engine, plies=random_plies)
     board = chess.Board()
@@ -181,6 +219,11 @@ def play_selfplay_game(engine_or_path, movetime=100, random_plies=6, max_moves=1
                     elif p == "cp" and i + 1 < len(parts):
                         try: eval_score = int(parts[i+1])
                         except: pass
+                    elif p == "mate" and i + 1 < len(parts):
+                        try:
+                            m_val = int(parts[i+1])
+                            eval_score = 2000 if m_val > 0 else -2000
+                        except: pass
             elif line.startswith("bestmove"):
                 parts = line.split()
                 if len(parts) >= 2:
@@ -199,12 +242,21 @@ def play_selfplay_game(engine_or_path, movetime=100, random_plies=6, max_moves=1
                 result, res_val = "1/2-1/2", 0.5
             break
 
+        teacher_bestmove = best_move
+        recorded_eval = eval_score
+        if teacher_engine is not None:
+            t_move, t_cp = teacher_engine.probe_depth(position_fen, target_depth=10)
+            if t_move and t_move not in ("0000", "(none)"):
+                teacher_bestmove = t_move
+                recorded_eval = t_cp
+
         game_positions.append({
             "ply": ply,
             "fen": position_fen,
             "side": "W" if ply % 2 == 0 else "B",
             "move": best_move,
-            "eval_cp": eval_score,
+            "bestmove": teacher_bestmove,
+            "eval_cp": recorded_eval,
             "depth": depth
         })
 
@@ -246,6 +298,8 @@ def main():
     parser.add_argument("--max-moves", type=int, default=100, help="Maximum full moves per game")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible openings")
     parser.add_argument("--workers", type=int, default=2, help="Parallel GPU self-play workers (default: 2 for Dual-GPU)")
+    parser.add_argument("--teacher", default=None, help="Optional teacher engine binary (auto-detects stockfish if present)")
+    parser.add_argument("--no-teacher", action="store_true", help="Disable teacher distillation during self-play")
 
     args = parser.parse_args()
     if args.seed is not None:
@@ -261,11 +315,21 @@ def main():
             name, value = item.split("=", 1)
             engine_options[name.strip()] = value.strip()
 
+    teacher_bin = None
+    if not args.no_teacher:
+        if args.teacher and os.path.exists(args.teacher):
+            teacher_bin = args.teacher
+        elif os.path.exists("/usr/local/bin/stockfish"):
+            teacher_bin = "/usr/local/bin/stockfish"
+        else:
+            teacher_bin = shutil.which("stockfish")
+
     num_workers = max(1, min(args.workers, args.games))
 
     print(f"\n=======================================================")
     print(f"Starting Self-Play Generation: {args.games} games ({num_workers} GPU worker(s))")
     print(f"Engine:    {args.engine}")
+    print(f"Teacher:   {teacher_bin if teacher_bin else 'None (Pure Self-Play)'}")
     print(f"Movetime:  {args.movetime} ms per move")
     print(f"Output:    {output_path}")
     print(f"=======================================================\n")
@@ -275,6 +339,7 @@ def main():
 
     if num_workers == 1:
         engine = UCIEngineInstance(args.engine, engine_options=engine_options)
+        teacher = UCIEngineInstance(teacher_bin, engine_options={"Threads": "1", "Hash": "16"}) if teacher_bin else None
         try:
             with open(output_path, "a") as f_out:
                 for g in range(1, args.games + 1):
@@ -282,7 +347,8 @@ def main():
                     game_data = play_selfplay_game(engine, movetime=args.movetime,
                                                    random_plies=args.random_plies,
                                                    max_moves=args.max_moves,
-                                                   engine_options=engine_options)
+                                                   engine_options=engine_options,
+                                                   teacher_engine=teacher)
                     g_time = time.time() - g_start
 
                     for pos in game_data["positions"]:
@@ -292,6 +358,7 @@ def main():
                             "fen": pos["fen"],
                             "side": pos["side"],
                             "move": pos["move"],
+                            "bestmove": pos.get("bestmove", pos["move"]),
                             "eval_cp": pos["eval_cp"],
                             "depth": pos["depth"],
                             "target_outcome": pos["target_outcome"],
@@ -303,6 +370,8 @@ def main():
                     print(f"Game {g:>3}/{args.games}: {game_data['result']:<7} ({game_data['plies']} plies, {len(game_data['positions'])} positions, {g_time:.1f}s)")
         finally:
             engine.close()
+            if teacher:
+                teacher.close()
     else:
         game_queue = queue.Queue()
         for g in range(1, args.games + 1):
@@ -316,6 +385,7 @@ def main():
                 if "Threads" not in worker_opts:
                     worker_opts["Threads"] = "2"
                 engine = UCIEngineInstance(args.engine, device_id=worker_idx, engine_options=worker_opts)
+                teacher = UCIEngineInstance(teacher_bin, engine_options={"Threads": "1", "Hash": "16"}) if teacher_bin else None
                 try:
                     while True:
                         try:
@@ -326,7 +396,8 @@ def main():
                         game_data = play_selfplay_game(engine, movetime=args.movetime,
                                                        random_plies=args.random_plies,
                                                        max_moves=args.max_moves,
-                                                       engine_options=worker_opts)
+                                                       engine_options=worker_opts,
+                                                       teacher_engine=teacher)
                         g_time = time.time() - g_start
                         with write_lock:
                             for pos in game_data["positions"]:
@@ -336,6 +407,7 @@ def main():
                                     "fen": pos["fen"],
                                     "side": pos["side"],
                                     "move": pos["move"],
+                                    "bestmove": pos.get("bestmove", pos["move"]),
                                     "eval_cp": pos["eval_cp"],
                                     "depth": pos["depth"],
                                     "target_outcome": pos["target_outcome"],
@@ -347,6 +419,8 @@ def main():
                             print(f"[GPU {worker_idx}] Game {g:>3}/{args.games}: {game_data['result']:<7} ({game_data['plies']} plies, {len(game_data['positions'])} positions, {g_time:.1f}s)")
                 finally:
                     engine.close()
+                    if teacher:
+                        teacher.close()
 
             threads = [threading.Thread(target=worker_fn, args=(w,)) for w in range(num_workers)]
             for t in threads:
