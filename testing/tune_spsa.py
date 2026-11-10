@@ -25,17 +25,41 @@ DEFAULT_PARAMS = {
     "ProbCutMargin": {"val": 180, "min": 80, "max": 400, "c": 20.0, "a": 2.0},
 }
 
+import copy
+
 class SPSATuner:
-    def __init__(self, engine_path, params=None, tc="60+0.5", games_per_iter=4):
+    def __init__(self, engine_path, params=None, tc="60+0.5", games_per_iter=4,
+                 step_scale=1.0, resume_best=False):
         self.engine_path = os.path.abspath(engine_path)
-        self.params = params or DEFAULT_PARAMS
+        self.params = copy.deepcopy(params or DEFAULT_PARAMS)
         self.tc = tc
         self.games_per_iter = games_per_iter
+        self.step_scale = max(0.05, float(step_scale))
         self.repo_dir = os.path.dirname(self.engine_path)
         self.results_dir = os.path.join(self.repo_dir, "testing", "results")
         self.best_params = None
         self.best_score = -1.0
         self.best_iteration = 0
+
+        if self.step_scale != 1.0:
+            for p in self.params.values():
+                p["a"] = p["a"] * self.step_scale
+                p["c"] = max(0.5, p["c"] * self.step_scale)
+
+        if resume_best:
+            best_file = os.path.join(self.results_dir, "best_search_params.json")
+            if os.path.exists(best_file):
+                try:
+                    with open(best_file, "r") as f:
+                        saved = json.load(f)
+                    saved_params = saved.get("parameters", {})
+                    for name, val in saved_params.items():
+                        if name in self.params:
+                            p = self.params[name]
+                            p["val"] = max(p["min"], min(p["max"], float(val)))
+                    self.best_params = {k: int(round(v["val"])) for k, v in self.params.items()}
+                except Exception:
+                    pass
 
     @staticmethod
     def option_string(theta):
@@ -218,11 +242,19 @@ def main():
     parser.add_argument("--selfplay-games", type=int, default=25, help="Games to generate if no dataset exists")
     parser.add_argument("--selfplay-movetime", type=int, default=80, help="Self-play movetime in milliseconds")
     parser.add_argument("--epochs", type=int, default=5, help="Neural-weight training epochs")
+    parser.add_argument("--step-scale", type=float, default=1.0, help="Scale factor for SPSA step/perturbation size (default: 1.0)")
+    parser.add_argument("--resume-best", action="store_true", help="Initialize SPSA center from saved best_search_params.json")
     parser.add_argument("--no-train-weights", action="store_true", help="Only tune/search-save; skip neural training")
 
     args = parser.parse_args()
 
-    tuner = SPSATuner(args.engine, tc=args.tc, games_per_iter=max(2, args.games))
+    tuner = SPSATuner(
+        args.engine,
+        tc=args.tc,
+        games_per_iter=max(2, args.games),
+        step_scale=args.step_scale,
+        resume_best=args.resume_best,
+    )
     tuner.run(
         iterations=args.iters,
         train_weights=not args.no_train_weights,

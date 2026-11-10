@@ -88,6 +88,15 @@ autonomous-daemon:
 autonomous-status:
 	python3 testing/autonomous_5day.py --status
 
+phase2-5day:
+	python3 testing/autonomous_phase2.py --start
+
+phase2-daemon:
+	python3 testing/autonomous_phase2.py --daemon
+
+phase2-status:
+	python3 testing/autonomous_phase2.py --status
+
 -include $(CPP_OBJS:.o=.d) $(C_OBJS:.o=.d)
 
-.PHONY: all clean windows windows-cuda test-epd test-tactics test-selfplay train autonomous-5day autonomous-daemon autonomous-status
+.PHONY: all clean windows windows-cuda test-epd test-tactics test-selfplay train autonomous-5day autonomous-daemon autonomous-status phase2-5day phase2-daemon phase2-status

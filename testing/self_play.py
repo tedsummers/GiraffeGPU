@@ -143,16 +143,32 @@ class UCIEngineInstance:
 
 # Built-in lightweight move validator / generator using python-chess if available,
 # or falling back to engine's own legal move responses.
-def get_random_opening(engine, plies=6):
-    """Create a legal, varied opening instead of reusing a tiny fixed book."""
-    board = chess.Board()
+def load_epd_fens(book_path):
+    """Load 6-field starting FEN strings from an EPD or FEN opening book."""
+    fens = []
+    if not book_path or not os.path.exists(book_path):
+        return fens
+    with open(book_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) >= 4:
+                fen = f"{parts[0]} {parts[1]} {parts[2]} {parts[3]} 0 1"
+                fens.append(fen)
+    return fens
+
+def get_random_opening(engine, plies=6, start_fen=None):
+    """Create a legal, varied opening from startpos or an opening book FEN."""
+    board = chess.Board(start_fen) if start_fen else chess.Board()
     moves = []
     for _ in range(max(0, plies)):
         legal = list(board.legal_moves)
         if not legal:
             break
-        # Keep the first move sensible while allowing broad opening coverage.
-        if not moves:
+        # Keep the first move sensible from startpos while allowing broad coverage.
+        if not moves and start_fen is None:
             preferred = [m for m in legal if board.san(m) in ("e4", "d4", "Nf3", "c4")]
             move = random.choice(preferred or legal)
         else:
@@ -161,7 +177,9 @@ def get_random_opening(engine, plies=6):
         board.push(move)
     return moves
 
-def play_selfplay_game(engine_or_path, movetime=100, random_plies=6, max_moves=100, engine_options=None, teacher_engine=None):
+def play_selfplay_game(engine_or_path, movetime=100, random_plies=6, max_moves=100,
+                       engine_options=None, teacher_engine=None, teacher_depth=10,
+                       book_fens=None):
     if chess is None:
         raise RuntimeError("python-chess is required for self-play dataset generation")
     owns_engine = isinstance(engine_or_path, str)
@@ -174,8 +192,9 @@ def play_selfplay_game(engine_or_path, movetime=100, random_plies=6, max_moves=1
         teacher_engine.send("isready")
         teacher_engine.wait_for("readyok")
 
-    moves_history = get_random_opening(engine, plies=random_plies)
-    board = chess.Board()
+    start_fen = random.choice(book_fens) if book_fens else None
+    moves_history = get_random_opening(engine, plies=random_plies, start_fen=start_fen)
+    board = chess.Board(start_fen) if start_fen else chess.Board()
     for opening_move in moves_history:
         board.push_uci(opening_move)
     game_positions = []
@@ -195,9 +214,14 @@ def play_selfplay_game(engine_or_path, movetime=100, random_plies=6, max_moves=1
                 result, res_val = "1/2-1/2", 0.5
             break
 
+        white_to_move = (board.turn == chess.WHITE)
         position_fen = board.fen()
         moves_str = " ".join(moves_history)
-        engine.send(f"position startpos moves {moves_str}")
+        if start_fen:
+            pos_cmd = f"position fen {start_fen} moves {moves_str}" if moves_str else f"position fen {start_fen}"
+        else:
+            pos_cmd = f"position startpos moves {moves_str}" if moves_str else "position startpos"
+        engine.send(pos_cmd)
         engine.send("isready")
         engine.wait_for("readyok")
 
@@ -233,8 +257,7 @@ def play_selfplay_game(engine_or_path, movetime=100, random_plies=6, max_moves=1
         if not best_move or best_move == "0000" or best_move == "(none)":
             # Checkmate or stalemate
             if board.is_check():
-                side_to_move = (ply % 2) # 0 = White, 1 = Black
-                if side_to_move == 0:
+                if white_to_move:
                     result, res_val = "0-1", 0.0
                 else:
                     result, res_val = "1-0", 1.0
@@ -245,7 +268,7 @@ def play_selfplay_game(engine_or_path, movetime=100, random_plies=6, max_moves=1
         teacher_bestmove = best_move
         recorded_eval = eval_score
         if teacher_engine is not None:
-            t_move, t_cp = teacher_engine.probe_depth(position_fen, target_depth=10)
+            t_move, t_cp = teacher_engine.probe_depth(position_fen, target_depth=teacher_depth)
             if t_move and t_move not in ("0000", "(none)"):
                 teacher_bestmove = t_move
                 recorded_eval = t_cp
@@ -253,7 +276,7 @@ def play_selfplay_game(engine_or_path, movetime=100, random_plies=6, max_moves=1
         game_positions.append({
             "ply": ply,
             "fen": position_fen,
-            "side": "W" if ply % 2 == 0 else "B",
+            "side": "W" if white_to_move else "B",
             "move": best_move,
             "bestmove": teacher_bestmove,
             "eval_cp": recorded_eval,
@@ -265,11 +288,11 @@ def play_selfplay_game(engine_or_path, movetime=100, random_plies=6, max_moves=1
 
         # Adjudicate extreme evaluations
         if eval_score > 900:
-            result = "1-0" if ply % 2 == 0 else "0-1"
+            result = "1-0" if white_to_move else "0-1"
             res_val = 1.0 if result == "1-0" else 0.0
             break
         elif eval_score < -900:
-            result = "0-1" if ply % 2 == 0 else "1-0"
+            result = "0-1" if white_to_move else "1-0"
             res_val = 0.0 if result == "0-1" else 1.0
             break
 
@@ -299,6 +322,8 @@ def main():
     parser.add_argument("--seed", type=int, default=None, help="Random seed for reproducible openings")
     parser.add_argument("--workers", type=int, default=2, help="Parallel GPU self-play workers (default: 2 for Dual-GPU)")
     parser.add_argument("--teacher", default=None, help="Optional teacher engine binary (auto-detects stockfish if present)")
+    parser.add_argument("--teacher-depth", type=int, default=10, help="Teacher distillation search depth (default: 10)")
+    parser.add_argument("--book", default=None, help="Optional EPD/FEN opening book path for starting positions")
     parser.add_argument("--no-teacher", action="store_true", help="Disable teacher distillation during self-play")
 
     args = parser.parse_args()
@@ -308,6 +333,10 @@ def main():
     repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     output_path = args.output if os.path.isabs(args.output) else os.path.join(repo_dir, args.output)
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    book_path = None
+    if args.book:
+        book_path = args.book if os.path.isabs(args.book) else os.path.join(repo_dir, args.book)
+    book_fens = load_epd_fens(book_path)
 
     engine_options = {}
     for item in args.engine_options.split(","):
@@ -329,7 +358,9 @@ def main():
     print(f"\n=======================================================")
     print(f"Starting Self-Play Generation: {args.games} games ({num_workers} GPU worker(s))")
     print(f"Engine:    {args.engine}")
-    print(f"Teacher:   {teacher_bin if teacher_bin else 'None (Pure Self-Play)'}")
+    print(f"Teacher:   {f'{teacher_bin} (depth {args.teacher_depth})' if teacher_bin else 'None (Pure Self-Play)'}")
+    if book_fens:
+        print(f"Book:      {book_path} ({len(book_fens)} lines + {args.random_plies} random plies)")
     print(f"Movetime:  {args.movetime} ms per move")
     print(f"Output:    {output_path}")
     print(f"=======================================================\n")
@@ -348,7 +379,9 @@ def main():
                                                    random_plies=args.random_plies,
                                                    max_moves=args.max_moves,
                                                    engine_options=engine_options,
-                                                   teacher_engine=teacher)
+                                                   teacher_engine=teacher,
+                                                   teacher_depth=args.teacher_depth,
+                                                   book_fens=book_fens)
                     g_time = time.time() - g_start
 
                     for pos in game_data["positions"]:
@@ -397,7 +430,9 @@ def main():
                                                        random_plies=args.random_plies,
                                                        max_moves=args.max_moves,
                                                        engine_options=worker_opts,
-                                                       teacher_engine=teacher)
+                                                       teacher_engine=teacher,
+                                                       teacher_depth=args.teacher_depth,
+                                                       book_fens=book_fens)
                         g_time = time.time() - g_start
                         with write_lock:
                             for pos in game_data["positions"]:

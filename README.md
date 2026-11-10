@@ -415,6 +415,37 @@ python3 testing/autonomous_5day.py --stop
 - **Resumable**: State is continuously persisted to `testing/results/autonomous_state.json`. If the machine restarts or the process is stopped, running `--daemon` or `--start` will automatically resume exactly where it left off.
 - **Auto-Promotion**: Whenever a candidate network wins an SPRT match at 95% confidence, it is deployed to `eval.net`. The autonomous Linux host can rebuild the portable Windows CPU fallback; the native Windows CUDA executable must be rebuilt on Windows with `build_windows_cuda.ps1`.
 
+### 7. Phase 2: 5-Day Master-Level Refinement System (`autonomous_phase2.py`)
+
+Once the initial 5-day training run (`autonomous_5day.py`) finishes and promotes GiraffeGPU into the **~2200–2300+ Elo** range, a second 5-day (120-hour) Master-Level Refinement pipeline (`testing/autonomous_phase2.py`) can be launched without modifying or recompiling the C++/CUDA engine binary.
+
+#### What Changes in Phase 2
+1. **Deeper Stockfish Teacher Supervision (`--teacher-depth 14`)**: Increases the Stockfish distillation probe from `depth 10` to `depth 14` during self-play to teach deep multi-move combinations, sacrifices, and prophylaxis.
+2. **Master Opening Book Curriculum (`--book testing/books/openings.epd --random-plies 2`)**: Starts self-play games from standard master opening lines plus 2 randomized plies (with `120ms` per move) instead of purely random plies from `startpos`.
+3. **Fine-Grained Micro-SPSA (`--step-scale 0.5 --resume-best`)**: Centers Day 1 SPSA perturbations directly on the best search parameters discovered in Phase 1 (`testing/results/best_search_params.json`) with halved perturbation step sizes.
+4. **Sharper Policy-Head & Trust-Region Schedule**: Trains for `15` epochs per cycle with a tightened value trust-region (`--lr 0.0003 --max-output-delta 0.035`) and boosted policy-head learning rate (`--policy-lr 0.0025`).
+5. **Phase 1 Process Guard**: Automatically checks `testing/results/autonomous.pid` before starting so Phase 1 and Phase 2 never accidentally compete for GPUs simultaneously.
+
+#### Commands to Run Phase 2 (After Phase 1 Completes)
+
+```bash
+# 1. Launch Phase 2 in background as a daemon (120-hour Master Refinement run):
+make phase2-daemon
+# or:
+python3 testing/autonomous_phase2.py --daemon
+
+# 2. Check live Phase 2 status anytime:
+make phase2-status
+# or:
+python3 testing/autonomous_phase2.py --status
+
+# 3. Follow real-time Phase 2 log output:
+tail -f testing/results/autonomous_phase2.log
+
+# 4. Stop Phase 2 gracefully anytime:
+python3 testing/autonomous_phase2.py --stop
+```
+
 ---
 
 ## Playing with CuteChess
