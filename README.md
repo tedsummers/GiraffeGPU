@@ -58,8 +58,10 @@
 
 | Stage | Estimated CCRL / FIDE Elo | Estimated Online Blitz / Rapid | Key Drivers |
 | :--- | :---: | :---: | :--- |
-| **Current Build (Pre-5-Day Run)** | **~2250 – 2350 Elo** | **~2450 – 2550** | • **~138k NPS** on Dual GPUs (~20x faster than original CPU Giraffe)<br>• Full PVS + LMR + Null Move + ProbCut + SEE + Countermove/History<br>• **Syzygy 3-4-5-6 Piece Tablebases** (perfect endgame WDL/DTZ play) |
-| **After 5-Day Autonomous GPU Training** | **~2450 – 2600 Elo** | **~2650 – 2800** | • **+150 to +250 Elo** from full-network (`w1, w2, w3, w_pol`) CUDA AdamW training on cumulative self-play positions + SPSA search tuning |
+| **Initial Bootstrap Build (Start of Day 1)** | **~1700 – 1750 Elo** | **~1900 – 1950** | • Bootstrap `eval.net` (only 3/64 hidden value weights active, zeroed Policy Head)<br>• Baseline PVS search at ~87k NPS before zero-copy & batched GPU kernels |
+| **Current Build (Day 1 GPU-Activated + SPSA)** | **~1800 – 1850 Elo** | **~2000 – 2050** | • **~138k NPS** on Dual GPUs (+58.4% speedup via zero-copy & batched PVS/qsearch)<br>• All 62/62 hidden `w3` neurons activated + SPSA-tuned search parameters (`+32.7 Elo`)<br>• **Syzygy 3-4-5-6 Piece Tablebases** (perfect endgame WDL/DTZ play) |
+| **After Phase 1 (5-Day Foundation Training)** | **~2200 – 2300+ Elo** | **~2400 – 2500** | • **+400 to +500 Elo** from Stockfish (`depth 10`) teacher distillation on ~150k–200k positions<br>• Full-network (`w1, w2, w3, w_pol`) CUDA AdamW training + 70/30 replay buffer |
+| **After Phase 2 (5-Day Master Refinement)** | **~2350 – 2450+ Elo** | **~2550 – 2650** | • **+120 to +180 Elo** from Master opening-book curriculum (`openings.epd`, `120ms/move`)<br>• Deeper Stockfish (`depth 14`) supervision, Micro-SPSA (`--step-scale 0.5`), and sharper Policy Head (`--policy-lr 0.0025`) |
 
 ### Supported NVIDIA GPU Models
 `GiraffeGPU` requires less than **250 MB of VRAM** and supports single-GPU, dual-GPU, and mixed-generation multi-GPU systems:
