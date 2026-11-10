@@ -417,16 +417,61 @@ python3 testing/autonomous_5day.py --stop
 
 ### 7. Phase 2: 5-Day Master-Level Refinement System (`autonomous_phase2.py`)
 
-Once the initial 5-day training run (`autonomous_5day.py`) finishes and promotes GiraffeGPU into the **~2200–2300+ Elo** range, a second 5-day (120-hour) Master-Level Refinement pipeline (`testing/autonomous_phase2.py`) can be launched without modifying or recompiling the C++/CUDA engine binary.
+Once the initial 5-day training run (`autonomous_5day.py`) finishes and promotes GiraffeGPU from its **~1750 Elo** starting point into the **~2200–2300+ Elo** range, a second 5-day (120-hour) **Master-Level Refinement** pipeline (`testing/autonomous_phase2.py`) can be launched to push the engine toward **~2350–2450+ Elo** (FIDE Master / International Master territory).
 
-#### What Changes in Phase 2
-1. **Deeper Stockfish Teacher Supervision (`--teacher-depth 14`)**: Increases the Stockfish distillation probe from `depth 10` to `depth 14` during self-play to teach deep multi-move combinations, sacrifices, and prophylaxis.
-2. **Master Opening Book Curriculum (`--book testing/books/openings.epd --random-plies 2`)**: Starts self-play games from standard master opening lines plus 2 randomized plies (with `120ms` per move) instead of purely random plies from `startpos`.
-3. **Fine-Grained Micro-SPSA (`--step-scale 0.5 --resume-best`)**: Centers Day 1 SPSA perturbations directly on the best search parameters discovered in Phase 1 (`testing/results/best_search_params.json`) with halved perturbation step sizes.
-4. **Sharper Policy-Head & Trust-Region Schedule**: Trains for `15` epochs per cycle with a tightened value trust-region (`--lr 0.0003 --max-output-delta 0.035`) and boosted policy-head learning rate (`--policy-lr 0.0025`).
-5. **Phase 1 Process Guard**: Automatically checks `testing/results/autonomous.pid` before starting so Phase 1 and Phase 2 never accidentally compete for GPUs simultaneously.
+#### Why Phase 2 Uses a Shifted Curriculum (Instead of Repeating Phase 1)
+In reinforcement learning and teacher distillation, repeating the exact same hyperparameters after 5 days yields diminishing returns once the Value Head MSE plateaus on fast `80ms` / `depth 10` games. Phase 2 unlocks a **second wave of Elo gains** by shifting the training curriculum to match a stronger engine:
+1. **Stronger Self-Play Trajectories**: Because GiraffeGPU starts Phase 2 at ~2250+ Elo, its self-play games reach complex, realistic master-level middlegames and endgames rather than early tactical blunders.
+2. **Deeper Stockfish Teacher Supervision (`--teacher-depth 14`)**: Increases the Stockfish distillation probe from `depth 10` to `depth 14` during self-play to teach deep multi-move combinations, positional sacrifices, and prophylaxis.
+3. **Master Opening Book Curriculum (`--book testing/books/openings.epd --random-plies 2`)**: Instead of playing 8 random plies from `startpos` (`80ms/move`), Phase 2 starts self-play games from standard master opening lines (Sicilian, Ruy Lopez, French, Queen's Gambit, King's Indian, English, etc.) plus 2 randomized plies at `120ms/move`.
+4. **Fine-Grained Micro-SPSA (`--step-scale 0.5 --resume-best`)**: Because search pruning thresholds (`LMRDepthThreshold`, `ProbCutMargin`, `AspirationWindow`, `NullMoveReduction`) interact closely with evaluation accuracy, Phase 2 Day 1 re-tunes the search parameters specifically for the newly trained Phase 1 network using halved perturbation step sizes centered around `testing/results/best_search_params.json`.
+5. **Sharper Policy-Head & Trust-Region Schedule**: Trains for `15` epochs per cycle with a tightened value trust-region (`--lr 0.0003 --max-output-delta 0.035`) to prevent catastrophic forgetting while boosting the 4,096-move policy head learning rate (`--policy-lr 0.0025`) to sharpen move ordering and beta-cutoffs.
 
-#### Commands to Run Phase 2 (After Phase 1 Completes)
+#### Zero Binary Recompilation Required
+Running Phase 2 requires **no changes or recompilation** to `./GiraffeGPU` (C++/CUDA):
+- **Externalized Neural Weights**: `./GiraffeGPU` loads [`eval.net`](file:///home/idiot/GiraffeGPU/eval.net) dynamically at startup (or via UCI `setoption name WeightsFile value <path>`).
+- **Runtime-Configurable Search Parameters**: All 5 SPSA-tuned search parameters (`AspirationWindow`, `NullMoveReduction`, `LMRMovesThreshold`, `LMRDepthThreshold`, `ProbCutMargin`) are live UCI options read automatically from `testing/results/best_search_options.txt`.
+- **Parameterized Native CUDA Trainer**: `./GiraffeGPU train` already accepts `epochs`, `lr`, `policy_lr`, `l2`, and `max_output_delta` directly on the command line:
+  ```bash
+  ./GiraffeGPU train <samples.tsv> <in.net> <out.net> <epochs> <lr> <policy_lr> <l2> <max_output_delta>
+  ```
+
+#### Phase 1 vs. Phase 2 Configuration Comparison
+
+| Parameter / Stage | Phase 1: Foundation (`autonomous_5day.py`) | Phase 2: Master Refinement (`autonomous_phase2.py`) |
+| :--- | :--- | :--- |
+| **Starting Engine Strength** | ~1750 Elo (Bootstrap `eval.net`) | ~2200–2300+ Elo (Phase 1 Promoted `eval.net`) |
+| **Target Completion Strength** | ~2200–2300+ Elo | ~2350–2450+ Elo |
+| **Day 1 SPSA Search Tuning** | Broad exploration (`--step-scale 1.0`, default center) | Micro-SPSA (`--step-scale 0.5 --resume-best` from Phase 1 best) |
+| **Self-Play Opening Source** | `startpos` + `8` random legal plies | Master EPD book (`testing/books/openings.epd`) + `2` random plies |
+| **Self-Play Search Time** | `80 ms` per move | `120 ms` per move |
+| **Stockfish Teacher Depth** | `depth 10` (~1–3 ms/pos) | `depth 14` (~8–15 ms/pos, deeper tactical/positional truth) |
+| **CUDA Training Epochs / Cycle** | `10` epochs | `15` epochs |
+| **Value Head Learning Rate (`--lr`)** | `0.0005` | `0.0003` (fine-grained convergence) |
+| **Policy Head Learning Rate (`--policy-lr`)** | `0.0010` | `0.0025` (sharper move ordering & LMR selectivity) |
+| **Trust-Region Clip (`--max-output-delta`)** | `0.050` | `0.035` (tighter stability protection) |
+| **Replay Buffer Sampling** | 70% Recent / 30% Historical | 70% Recent / 30% Historical |
+| **Promotion Gauntlet** | 40 games @ `60+0.5` (`--concurrency 2`, SPRT / `LOS >= 80%`) | 40 games @ `60+0.5` (`--concurrency 2`, SPRT / `LOS >= 80%`) |
+
+#### Phase 2 5-Day Progression Schedule
+
+| Day | Focus Area | What the Phase 2 Daemon Executes | Expected Elo Trajectory |
+| :--- | :--- | :--- | :--- |
+| **Day 1** | **Micro-SPSA Search Refinement** | Fine-tunes `AspirationWindow`, `NullMoveReduction`, `LMRMovesThreshold`, `LMRDepthThreshold`, and `ProbCutMargin` around the Phase 1 best vector (`--step-scale 0.5 --resume-best`) + 30 opening-book self-play games/cycle (`depth 14` teacher). | **~2250 $\rightarrow$ ~2280 Elo** |
+| **Day 2** | **Master Opening Book Distillation** | 50 dual-GPU self-play games/cycle from `openings.epd` (`120ms/move`, `depth 14` teacher) + 15-epoch CUDA AdamW training + 40-game SPRT/LOS promotion gauntlets at `60+0.5`. | **~2280 $\rightarrow$ ~2330 Elo** |
+| **Day 3** | **Deep Middlegame & Policy Sharpening** | High-priority policy-head distillation (`--policy-lr 0.0025`) on complex middlegames so GiraffeGPU searches Stockfish's top choice first at 2–3x higher rate. | **~2330 $\rightarrow$ ~2380 Elo** |
+| **Day 4** | **Endgame & Tight Trust-Region Tuning** | Fine-grained full-network updates (`--lr 0.0003 --max-output-delta 0.035`) across 70/30 recency replay buffer, gated by 40-game dual-GPU matches. | **~2380 $\rightarrow$ ~2420+ Elo** |
+| **Day 5** | **Master Validation & Packaging** | Final validation self-play, deeper Bratko-Kopec (`1000ms/pos`) & tactical (`500ms/pos`) suites, and packaging of `GiraffeGPU`, `GiraffeGPU.exe`, and `eval.net`. | **~2400–2450+ Elo** |
+
+#### Process Guard & Dedicated State Files
+- **Phase 1 Process Guard**: `autonomous_phase2.py` checks `testing/results/autonomous.pid` on startup and refuses to launch if Phase 1 is still active (unless `--force` is passed), preventing both daemons from competing for GPUs.
+- **Dedicated Phase 2 Files**:
+  - State file: `testing/results/autonomous_phase2_state.json`
+  - Log file: `testing/results/autonomous_phase2.log`
+  - PID file: `testing/results/autonomous_phase2.pid`
+  - Final report: `testing/results/phase2_5day_final_report.md`
+
+#### Commands to Run and Monitor Phase 2 (After Phase 1 Completes)
 
 ```bash
 # 1. Launch Phase 2 in background as a daemon (120-hour Master Refinement run):
@@ -442,8 +487,11 @@ python3 testing/autonomous_phase2.py --status
 # 3. Follow real-time Phase 2 log output:
 tail -f testing/results/autonomous_phase2.log
 
-# 4. Stop Phase 2 gracefully anytime:
+# 4. Stop Phase 2 gracefully anytime (finishes current step cleanly):
 python3 testing/autonomous_phase2.py --stop
+
+# 5. Optional: Run a rapid 1-cycle verification test (~15 mins):
+python3 testing/autonomous_phase2.py --test-run
 ```
 
 ---
