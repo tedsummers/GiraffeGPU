@@ -425,9 +425,9 @@ tail -f testing/results/autonomous.log
 python3 testing/autonomous_5day.py --stop
 ```
 
-#### Fault-Tolerance & State Persistence
+#### Fault-Tolerance, State Persistence, & Elo-Tagged Checkpoints
 - **Resumable**: State is continuously persisted to `testing/results/autonomous_state.json`. If the machine restarts or the process is stopped, running `--daemon` or `--start` will automatically resume exactly where it left off.
-- **Auto-Promotion**: Whenever a candidate network wins an SPRT match at 95% confidence, it is deployed to `eval.net`. The autonomous Linux host can rebuild the portable Windows CPU fallback; the native Windows CUDA executable must be rebuilt on Windows with `build_windows_cuda.ps1`.
+- **Auto-Promotion & `<elo>_eval.net` Checkpoints**: Whenever a candidate network wins an SPRT/LOS promotion match, it is deployed to `eval.net` and **automatically archived as `<elo>_eval.net`** in the repository root (e.g., `1880_eval.net`, `1915_eval.net`, `1950_eval.net`, etc.) with full match metadata logged to `testing/results/elo_progression.json`. The autonomous Linux host also rebuilds the portable Windows CPU fallback (`GiraffeGPU.exe`).
 
 ### 7. Phase 2: 5-Day Master-Level Refinement System (`autonomous_phase2.py`)
 

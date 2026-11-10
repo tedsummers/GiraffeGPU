@@ -14,6 +14,7 @@ import argparse
 import subprocess
 import json
 import re
+import shutil
 from datetime import datetime
 
 def elo_to_score(elo):
@@ -245,6 +246,51 @@ def run_match(engine1_path, engine2_path, games=20, tc="60+0.5", book_path=None,
         sprt['status'] = f"ACCEPTED (LOS {stats['los']:.1f}% >= 80.0% at match completion)"
         print(f"\nSPRT Decision: {sprt['status']}")
 
+    archived_checkpoint = None
+    if sprt_mode and sprt['status'].startswith("ACCEPTED") and total_played >= 10:
+        cand_weights = None
+        if engine1_options:
+            for opt in engine1_options.split(","):
+                opt = opt.strip()
+                if opt.startswith("WeightsFile="):
+                    cand_weights = opt.split("=", 1)[1].strip()
+                    break
+        if cand_weights and os.path.exists(cand_weights):
+            repo_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            results_dir = os.path.join(repo_dir, "testing", "results")
+            os.makedirs(results_dir, exist_ok=True)
+            prog_file = os.path.join(results_dir, "elo_progression.json")
+            prog_data = {"current_elo": 1850.0, "promotions": []}
+            if os.path.exists(prog_file):
+                try:
+                    with open(prog_file, "r") as f:
+                        prog_data = json.load(f)
+                except Exception:
+                    pass
+            # Apply Bayesian-damped Elo gain (clamped to [15, 45] Elo per promotion)
+            raw_elo = max(0.0, float(stats.get("elo", 25.0)))
+            damped_gain = max(15.0, min(45.0, raw_elo * 0.55 if raw_elo > 0 else 25.0))
+            new_elo = float(prog_data.get("current_elo", 1850.0)) + damped_gain
+            elo_tag = int(round(new_elo / 5.0) * 5)
+            while os.path.exists(os.path.join(repo_dir, f"{elo_tag}_eval.net")):
+                elo_tag += 5
+            new_elo = float(elo_tag)
+            archived_checkpoint = os.path.join(repo_dir, f"{elo_tag}_eval.net")
+            shutil.copy(cand_weights, archived_checkpoint)
+            prog_data["current_elo"] = new_elo
+            prog_data.setdefault("promotions", []).append({
+                "timestamp": datetime.now().isoformat(),
+                "elo_tag": elo_tag,
+                "checkpoint_file": f"{elo_tag}_eval.net",
+                "match_score": f"{wins}-{losses}-{draws}",
+                "raw_match_elo": round(raw_elo, 1),
+                "damped_elo_gain": round(damped_gain, 1),
+                "los_pct": round(stats.get("los", 0.0), 1),
+                "sprt_status": sprt["status"],
+            })
+            with open(prog_file, "w") as f:
+                json.dump(prog_data, f, indent=2)
+
     print("\n=======================================================")
     print("FINAL MATCH RESULTS:")
     print(f"  {e1_name} vs {e2_name}")
@@ -253,6 +299,8 @@ def run_match(engine1_path, engine2_path, games=20, tc="60+0.5", book_path=None,
     print(f"  LOS:    {stats['los']:.1f}%")
     if sprt_mode:
         print(f"  SPRT:   LLR {sprt['llr']:.2f} [{sprt['lower']:.2f}, {sprt['upper']:.2f}] -> {sprt['status']}")
+    if archived_checkpoint:
+        print(f"  Saved:  {archived_checkpoint}")
     print(f"  PGN:    {pgn_path}")
     print("=======================================================\n")
 

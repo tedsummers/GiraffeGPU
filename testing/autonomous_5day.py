@@ -293,6 +293,19 @@ def print_status():
     print(f"Self-Play Games:    {state.get('total_selfplay_games', 0)}")
     print(f"Promoted Networks:  {state.get('promoted_networks', 0)}")
     print(f"Rejected Networks:  {state.get('rejected_networks', 0)}")
+    prog_file = os.path.join(RESULTS_DIR, "elo_progression.json")
+    if os.path.exists(prog_file):
+        try:
+            with open(prog_file, "r") as pf:
+                prog = json.load(pf)
+            print(f"Estimated Elo:      ~{int(prog.get('current_elo', 1850))} Elo")
+            if prog.get("promotions"):
+                latest_ckpt = prog["promotions"][-1].get("checkpoint_file", "")
+                print(f"Latest Checkpoint:  {latest_ckpt} ({len(prog['promotions'])} saved)")
+        except Exception:
+            pass
+    else:
+        print("Estimated Elo:      ~1850 Elo (Day 1 SPSA Baseline)")
     print(f"Latest Log:         {LOG_FILE}")
     print("=======================================================\n")
 

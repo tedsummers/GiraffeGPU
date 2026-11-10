@@ -347,6 +347,17 @@ def print_status():
     print(f"Completed Cycles:     {st['completed_cycles']}")
     print(f"Self-Play Games:      {st['total_selfplay_games']}")
     print(f"Promoted Networks:    {st['promoted_networks']} (Rejected: {st['rejected_networks']})")
+    prog_file = os.path.join(RESULTS_DIR, "elo_progression.json")
+    if os.path.exists(prog_file):
+        try:
+            with open(prog_file, "r") as pf:
+                prog = json.load(pf)
+            print(f"Estimated Elo:        ~{int(prog.get('current_elo', 1850))} Elo")
+            if prog.get("promotions"):
+                latest_ckpt = prog["promotions"][-1].get("checkpoint_file", "")
+                print(f"Latest Checkpoint:    {latest_ckpt} ({len(prog['promotions'])} saved)")
+        except Exception:
+            pass
     if st.get("history"):
         last = st["history"][-1]
         print(f"Latest Benchmarks:    BK={last['bk_score_pct']:.1f}% | Tactics={last['tactics_score_pct']:.1f}%")
