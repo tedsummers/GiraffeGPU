@@ -62,7 +62,7 @@ Because **GiraffeGPU** searches **~45x faster (`~138,000 NPS` on Dual GPUs; `~65
 
 | Stage / Hardware Configuration | Search Speed (NPS) | Estimated CCRL / FIDE Elo | Estimated Online Blitz / Rapid | Key Drivers |
 | :--- | :---: | :---: | :---: | :--- |
-| **Initial Bootstrap Build (Start of Day 1)** | ~87,000 | **~1700 – 1750 Elo** | **~1900 – 1950** | • Pre-training bootstrap `eval.net` (59/62 hidden value weights & Policy Head zeroed out) |
+| **Initial Bootstrap Build (`orginal_eval.net`)** | ~87,000 | **~1700 – 1750 Elo** | **~1900 – 1950** | • Pre-training bootstrap [`orginal_eval.net`](file:///home/idiot/GiraffeGPU/orginal_eval.net) (59/62 hidden value weights & Policy Head zeroed out; preserved in repo for reproducibility via `cp orginal_eval.net eval.net`) |
 | **Day 1 GPU-Activated + SPSA Build** | **~138,000** | **~1800 – 1850 Elo** | **~2000 – 2050** | • Zero-copy + batched GPU kernels (+58.4% NPS), all 62/62 hidden `w3` neurons activated, SPSA search tuning |
 | **Original 2015 CPU Giraffe (Reference)** | ~3,000 | **~2410 – 2463 Elo** | **~2600 – 2650** | • Matthew Lai's 2015 cluster-trained `eval.net` on CPU (basic search, value-only, no Syzygy) |
 | **After Phase 1 (5-Day Foundation Training)** | **~138,000** | **~2350 – 2500 Elo** | **~2550 – 2700** | • Stockfish (`depth 10`) teacher distillation across ~150k–200k positions + full-network CUDA AdamW |
