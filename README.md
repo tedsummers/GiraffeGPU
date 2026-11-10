@@ -425,9 +425,20 @@ tail -f testing/results/autonomous.log
 python3 testing/autonomous_5day.py --stop
 ```
 
-#### Fault-Tolerance, State Persistence, & Elo-Tagged Checkpoints
+#### Fault-Tolerance, State Persistence, & Elo-Tagged Checkpoints (`<elo>_eval.net`)
 - **Resumable**: State is continuously persisted to `testing/results/autonomous_state.json`. If the machine restarts or the process is stopped, running `--daemon` or `--start` will automatically resume exactly where it left off.
-- **Auto-Promotion & `<elo>_eval.net` Checkpoints**: Whenever a candidate network wins an SPRT/LOS promotion match, it is deployed to `eval.net` and **automatically archived as `<elo>_eval.net`** in the repository root (e.g., `1880_eval.net`, `1915_eval.net`, `1950_eval.net`, etc.) with full match metadata logged to `testing/results/elo_progression.json`. The autonomous Linux host also rebuilds the portable Windows CPU fallback (`GiraffeGPU.exe`).
+- **Automatic `<elo>_eval.net` Archiving on Promotion**: Whenever a candidate network wins an SPRT/LOS promotion match in either Phase 1 or Phase 2, [`testing/match_sprt.py`](file:///home/idiot/GiraffeGPU/testing/match_sprt.py#L248-L290) computes its Bayesian-damped Elo gain, updates the cumulative rating in `testing/results/elo_progression.json`, and saves a permanent copy of the promoted network in the repository root named `<elo>_eval.net`:
+  - [`orginal_eval.net`](file:///home/idiot/GiraffeGPU/orginal_eval.net) — Initial pre-training bootstrap network (`~1750 Elo`)
+  - [`1850_eval.net`](file:///home/idiot/GiraffeGPU/1850_eval.net) — Day 1 GPU-activated network (all 62/62 hidden `w3` neurons active + SPSA baseline, `~1850 Elo`)
+  - `1880_eval.net`, `1915_eval.net`, `1950_eval.net`, `2000_eval.net`, ... — Automatically saved each time a candidate network passes the SPRT/LOS promotion gate
+- **Playing Against or Benchmarking Specific Elo Checkpoints**:
+  ```bash
+  # Load any historical Elo checkpoint via UCI or CuteChess:
+  cutechess-cli \
+    -engine cmd=./GiraffeGPU name=Giraffe_Latest option.WeightsFile=eval.net \
+    -engine cmd=./GiraffeGPU name=Giraffe_1850 option.WeightsFile=1850_eval.net \
+    -each proto=uci tc=60+0.5 -rounds 10 -concurrency 2
+  ```
 
 ### 7. Phase 2: 5-Day Master-Level Refinement System (`autonomous_phase2.py`)
 
