@@ -97,6 +97,12 @@ phase2-daemon:
 phase2-status:
 	python3 testing/autonomous_phase2.py --status
 
+view-match:
+	python3 testing/view_match.py
+
+watch-match:
+	python3 testing/view_match.py --watch
+
 -include $(CPP_OBJS:.o=.d) $(C_OBJS:.o=.d)
 
-.PHONY: all clean windows windows-cuda test-epd test-tactics test-selfplay train autonomous-5day autonomous-daemon autonomous-status phase2-5day phase2-daemon phase2-status
+.PHONY: all clean windows windows-cuda test-epd test-tactics test-selfplay train autonomous-5day autonomous-daemon autonomous-status phase2-5day phase2-daemon phase2-status view-match watch-match

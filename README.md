@@ -418,10 +418,15 @@ make autonomous-status
 # or:
 python3 testing/autonomous_5day.py --status
 
-# 3. Follow real-time log output:
+# 3. Watch the active promotion match live in the terminal (auto-refreshing scoreboard & board view):
+make watch-match
+# or:
+python3 testing/view_match.py --watch
+
+# 4. Follow real-time log output:
 tail -f testing/results/autonomous.log
 
-# 4. Stop the daemon gracefully anytime (finishes current cycle cleanly):
+# 5. Stop the daemon gracefully anytime (finishes current cycle cleanly):
 python3 testing/autonomous_5day.py --stop
 ```
 
