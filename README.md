@@ -134,6 +134,7 @@ GiraffeGPU has a native CUDA build for Linux and a separate native CUDA build pa
 - **NVIDIA GPU Driver & CUDA Toolkit**: `nvcc` 11.0+ (tested on CUDA 13.4, SM 8.6 & SM 12.0)
 - **Compiler**: C++17 compliant compiler (`g++` 8+ or `clang++` 7+)
 - **Make** or **CMake** (3.18+)
+- **Python 3 (3.8+)**: Required prerequisite for running testing, benchmarking, training, and match monitoring tools (`pip install chess numpy`)
 
 #### Build with Make (Recommended on Linux)
 ```bash
@@ -275,6 +276,8 @@ Launch `./GiraffeGPU` (Linux) or `.\GiraffeGPU.exe` (Windows) directly:
 ---
 
 ## Testing & Playing Strength Improvement Framework
+
+> **Prerequisite**: **Python 3 (3.8+)** is required to run the automated testing tools, self-play generators, neural network training pipelines, match monitors, and autonomous improvement scripts (`pip install chess numpy`). `cutechess-cli` and `stockfish` are optional external tools used for automated tournament matches and grandmaster teacher distillation.
 
 GiraffeGPU includes a complete automated testing, benchmarking, and training suite in the `testing/` directory to measure and systematically improve engine playing strength.
 
