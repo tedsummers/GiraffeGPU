@@ -902,7 +902,13 @@ static int probe_dtz_table(const struct pos *pos, int wdl, int *success)
         res = decompress_pairs(entry->precomp, idx);
 
         if (entry->flags & 2)
-            res = entry->map[entry->map_idx[wdl_to_map[wdl + 2]] + res];
+        {
+            int idx_m = wdl_to_map[wdl + 2];
+            if (!(entry->flags & 16))
+                res = entry->map[entry->map_idx[idx_m] + res];
+            else
+                res = ((uint16_t *)entry->map)[entry->map_idx[idx_m] + res];
+        }
         if (!(entry->flags & pa_flags[wdl + 2]) || (wdl & 1))
             res *= 2;
     }
@@ -940,7 +946,13 @@ static int probe_dtz_table(const struct pos *pos, int wdl, int *success)
         res = decompress_pairs(entry->file[f].precomp, idx);
 
         if (entry->flags[f] & 2)
-            res = entry->map[entry->map_idx[f][wdl_to_map[wdl + 2]] + res];
+        {
+            int idx_m = wdl_to_map[wdl + 2];
+            if (!(entry->flags[f] & 16))
+                res = entry->map[entry->map_idx[f][idx_m] + res];
+            else
+                res = ((uint16_t *)entry->map)[entry->map_idx[f][idx_m] + res];
+        }
         if (!(entry->flags[f] & pa_flags[wdl + 2]) || (wdl & 1))
             res *= 2;
     }
@@ -1031,18 +1043,6 @@ static uint16_t *gen_captures_or_promotions(const struct pos *pos,
             unsigned to = lsb(att);
             moves = add_move(moves, (rank(to) == 7 || rank(to) == 0), from,
                 to);
-        }
-        if (pos->turn && rank(from) == 6)
-        {
-            unsigned to = from + 8;
-            if ((board(to) & occ) == 0)
-                moves = add_move(moves, true, from, to);
-        }
-        else if (!pos->turn && rank(from) == 1)
-        {
-            unsigned to = from - 8;
-            if ((board(to) & occ) == 0)
-                moves = add_move(moves, true, from, to);
         }
     }
     return moves;
@@ -1544,7 +1544,11 @@ static int probe_dtz_no_ep(const struct pos *pos, int *success)
             if (v > 0 && v + 1 < best)
                 best = v + 1;
         }
-        assert(best != BEST_NONE);
+        if (best == BEST_NONE)
+        {
+            *success = 0;
+            return 0;
+        }
         return best;
     }
     else

@@ -818,7 +818,7 @@ static void init_indices(void)
 }
 
 #ifndef CONNECTED_KINGS
-static uint64 encode_piece(struct TBEntry_piece *ptr, ubyte *norm, int *pos, int *factor)
+static uint64 encode_piece(struct TBEntry_piece *ptr, ubyte *norm, int *pos, uint64 *factor)
 {
   uint64 idx;
   int i, j, k, m, l, p;
@@ -899,7 +899,7 @@ static uint64 encode_piece(struct TBEntry_piece *ptr, ubyte *norm, int *pos, int
   return idx;
 }
 #else
-static uint64 encode_piece(struct TBEntry_piece *ptr, ubyte *norm, int *pos, int *factor)
+static uint64 encode_piece(struct TBEntry_piece *ptr, ubyte *norm, int *pos, uint64 *factor)
 {
   uint64 idx;
   int i, j, k, m, l, p;
@@ -1027,7 +1027,7 @@ static int pawn_file(struct TBEntry_pawn *ptr, int *pos)
   return file_to_file[pos[0] & 0x07];
 }
 
-static uint64 encode_pawn(struct TBEntry_pawn *ptr, ubyte *norm, int *pos, int *factor)
+static uint64 encode_pawn(struct TBEntry_pawn *ptr, ubyte *norm, int *pos, uint64 *factor)
 {
   uint64 idx;
   int i, j, k, m, s, t;
@@ -1085,12 +1085,12 @@ static uint64 encode_pawn(struct TBEntry_pawn *ptr, ubyte *norm, int *pos, int *
   return idx;
 }
 
-static ubyte decompress_pairs(struct PairsData *d, uint64 index);
+static int decompress_pairs(struct PairsData *d, uint64 index);
 
 // place k like pieces on n squares
-static int subfactor(int k, int n)
+static uint64 subfactor(uint64 k, uint64 n)
 {
-  int i, f, l;
+  uint64 i, f, l;
 
   f = n;
   l = 1;
@@ -1102,7 +1102,7 @@ static int subfactor(int k, int n)
   return f / l;
 }
 
-static uint64 calc_factors_piece(int *factor, int num, int order, ubyte *norm, ubyte enc_type)
+static uint64 calc_factors_piece(uint64 *factor, int num, int order, ubyte *norm, ubyte enc_type)
 {
   int i, k, n;
   uint64 f;
@@ -1117,7 +1117,7 @@ static uint64 calc_factors_piece(int *factor, int num, int order, ubyte *norm, u
   f = 1;
   for (i = norm[0], k = 0; i < num || k == order; k++) {
     if (k == order) {
-      factor[0] = (int)f;
+      factor[0] = f;
 #ifndef CONNECTED_KINGS
       f *= pivfac[enc_type];
 #else
@@ -1127,7 +1127,7 @@ static uint64 calc_factors_piece(int *factor, int num, int order, ubyte *norm, u
 	f *= mfactor[enc_type - 2];
 #endif
     } else {
-      factor[i] = (int)f;
+      factor[i] = f;
       f *= subfactor(norm[i], n);
       n -= norm[i];
       i += norm[i];
@@ -1137,7 +1137,7 @@ static uint64 calc_factors_piece(int *factor, int num, int order, ubyte *norm, u
   return f;
 }
 
-static uint64 calc_factors_pawn(int *factor, int num, int order, int order2, ubyte *norm, int file)
+static uint64 calc_factors_pawn(uint64 *factor, int num, int order, int order2, ubyte *norm, int file)
 {
   int i, k, n;
   uint64 f;
@@ -1149,13 +1149,13 @@ static uint64 calc_factors_pawn(int *factor, int num, int order, int order2, uby
   f = 1;
   for (k = 0; i < num || k == order || k == order2; k++) {
     if (k == order) {
-      factor[0] = (int)f;
+      factor[0] = f;
       f *= pfactor[norm[0] - 1][file];
     } else if (k == order2) {
-      factor[norm[0]] = (int)f;
+      factor[norm[0]] = f;
       f *= subfactor(norm[norm[0]], 48 - norm[0]);
     } else {
-      factor[i] = (int)f;
+      factor[i] = f;
       f *= subfactor(norm[i], n);
       n -= norm[i];
       i += norm[i];
@@ -1316,8 +1316,8 @@ static struct PairsData *setup_pairs(unsigned char *data, uint64 tb_size, uint64
 
   int blocksize = data[1];
   int idxbits = data[2];
-  int real_num_blocks = *(uint32 *)(&data[4]);
-  int num_blocks = real_num_blocks + *(ubyte *)(&data[3]);
+  uint64 real_num_blocks = *(uint32 *)(&data[4]);
+  uint64 num_blocks = real_num_blocks + *(ubyte *)(&data[3]);
   int max_len = data[8];
   int min_len = data[9];
   int h = max_len - min_len + 1;
@@ -1331,7 +1331,7 @@ static struct PairsData *setup_pairs(unsigned char *data, uint64 tb_size, uint64
   d->min_len = min_len;
   *next = &data[12 + 2 * h + 3 * num_syms + (num_syms & 1)];
 
-  int num_indices = (int)((tb_size + (1ULL << idxbits) - 1) >> idxbits);
+  uint64 num_indices = (tb_size + (1ULL << idxbits) - 1) >> idxbits;
   size[0] = 6ULL * num_indices;
   size[1] = 2ULL * num_blocks;
   size[2] = (1ULL << blocksize) * real_num_blocks;
@@ -1507,9 +1507,17 @@ static int init_table_dtz(struct TBEntry *entry)
     ptr->map = data;
     if (ptr->flags & 2) {
       int i;
-      for (i = 0; i < 4; i++) {
-	     ptr->map_idx[i] = (ushort)(data + 1 - ptr->map);
-	     data += 1 + data[0];
+      if (!(ptr->flags & 16)) {
+        for (i = 0; i < 4; i++) {
+          ptr->map_idx[i] = (ushort)(data + 1 - ptr->map);
+          data += 1 + data[0];
+        }
+      } else {
+        data += ((uintptr_t)data) & 0x01;
+        for (i = 0; i < 4; i++) {
+          ptr->map_idx[i] = (ushort)((uint16_t *)data + 1 - (uint16_t *)ptr->map);
+          data += 2 + 2 * (*(uint16_t *)data);
+        }
       }
       data += ((uintptr_t)data) & 0x01;
     }
@@ -1540,11 +1548,19 @@ static int init_table_dtz(struct TBEntry *entry)
     ptr->map = data;
     for (f = 0; f < files; f++) {
       if (ptr->flags[f] & 2) {
-	    int i;
-	    for (i = 0; i < 4; i++) {
-	       ptr->map_idx[f][i] = (ushort)(data + 1 - ptr->map);
-	       data += 1 + data[0];
-	    }
+        int i;
+        if (!(ptr->flags[f] & 16)) {
+          for (i = 0; i < 4; i++) {
+            ptr->map_idx[f][i] = (ushort)(data + 1 - ptr->map);
+            data += 1 + data[0];
+          }
+        } else {
+          data += ((uintptr_t)data) & 0x01;
+          for (i = 0; i < 4; i++) {
+            ptr->map_idx[f][i] = (ushort)((uint16_t *)data + 1 - (uint16_t *)ptr->map);
+            data += 2 + 2 * (*(uint16_t *)data);
+          }
+        }
       }
     }
     data += ((uintptr_t)data) & 0x01;
@@ -1569,15 +1585,15 @@ static int init_table_dtz(struct TBEntry *entry)
   return 1;
 }
 
-static ubyte decompress_pairs(struct PairsData *d, uint64 idx)
+static int decompress_pairs(struct PairsData *d, uint64 idx)
 {
   if (!d->idxbits)
     return d->min_len;
 
-  uint32 mainidx = (uint32)(idx >> d->idxbits);
+  uint64 mainidx = idx >> d->idxbits;
   int litidx = (int)(idx & (((uint64)1 << d->idxbits) - 1)) - ((uint64)1 << (d->idxbits - 1));
-  uint32 block = *(uint32 *)(d->indextable + 6 * mainidx);
-  litidx += *(ushort *)(d->indextable + 6 * mainidx + 4);
+  uint32 block = *(uint32 *)(d->indextable + 6ULL * mainidx);
+  litidx += *(ushort *)(d->indextable + 6ULL * mainidx + 4);
   if (litidx < 0) {
     do {
       litidx += d->sizetable[--block] + 1;
@@ -1587,7 +1603,7 @@ static ubyte decompress_pairs(struct PairsData *d, uint64 idx)
       litidx -= d->sizetable[block++] + 1;
   }
 
-  uint32 *ptr = (uint32 *)(d->data + (block << d->blocksize));
+  uint32 *ptr = (uint32 *)(d->data + ((uint64)block << d->blocksize));
 
   int m = d->min_len;
   ushort *offset = d->offset;
@@ -1652,7 +1668,7 @@ static ubyte decompress_pairs(struct PairsData *d, uint64 idx)
     }
   }
 
-  return *(sympat + 3 * sym);
+  return *(ushort *)(sympat + 3 * sym) & 0x0fff;
 }
 
 void load_dtz_table(char *str, uint64 key1, uint64 key2)
