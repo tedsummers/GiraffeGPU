@@ -47,9 +47,9 @@
 //#define DECOMP64
 #endif
 
-#define TBMAX_PIECE 254
-#define TBMAX_PAWN 256
-#define HSHMAX 5
+#define TBMAX_PIECE 650
+#define TBMAX_PAWN 861
+#define HSHMAX 12
 
 // for variants where kings can connect and/or captured
 // #define CONNECTED_KINGS
@@ -316,7 +316,7 @@ static void init_tb(char *str)
 void init_tablebases(const char *path)
 {
   char str[16];
-  int i, j, k, l;
+  int i, j, k, l, m;
 
   if (initialized) {
     free(path_string);
@@ -426,6 +426,36 @@ void init_tablebases(const char *path)
 	  sprintf(str, "K%c%c%c%cvK", pchr[i], pchr[j], pchr[k], pchr[l]);
 	  init_tb(str);
 	}
+
+  /* 7-piece tablebases: 3 vs 2 */
+  for (i = 1; i < 6; i++)
+    for (j = i; j < 6; j++)
+      for (k = j; k < 6; k++)
+	for (l = 1; l < 6; l++)
+	  for (m = l; m < 6; m++) {
+	    sprintf(str, "K%c%c%cvK%c%c", pchr[i], pchr[j], pchr[k], pchr[l], pchr[m]);
+	    init_tb(str);
+	  }
+
+  /* 7-piece tablebases: 4 vs 1 */
+  for (i = 1; i < 6; i++)
+    for (j = i; j < 6; j++)
+      for (k = j; k < 6; k++)
+	for (l = k; l < 6; l++)
+	  for (m = 1; m < 6; m++) {
+	    sprintf(str, "K%c%c%c%cvK%c", pchr[i], pchr[j], pchr[k], pchr[l], pchr[m]);
+	    init_tb(str);
+	  }
+
+  /* 7-piece tablebases: 5 vs 0 */
+  for (i = 1; i < 6; i++)
+    for (j = i; j < 6; j++)
+      for (k = j; k < 6; k++)
+	for (l = k; l < 6; l++)
+	  for (m = l; m < 6; m++) {
+	    sprintf(str, "K%c%c%c%c%cvK", pchr[i], pchr[j], pchr[k], pchr[l], pchr[m]);
+	    init_tb(str);
+	  }
 
 //  printf("Found %d tablebases.\n", TBnum_piece + TBnum_pawn);
 }
@@ -793,7 +823,7 @@ static uint64 encode_piece(struct TBEntry_piece *ptr, ubyte *norm, int *pos, int
   uint64 idx;
   int i, j, k, m, l, p;
   int n = ptr->num;
-  assert(n>=0 && n<7);
+  assert(n>=0 && n<=TBPIECES);
 
   if (pos[0] & 0x04) {
     for (i = 0; i < n; i++)
@@ -874,7 +904,7 @@ static uint64 encode_piece(struct TBEntry_piece *ptr, ubyte *norm, int *pos, int
   uint64 idx;
   int i, j, k, m, l, p;
   int n = ptr->num;
-  assert(n>=0 && n<7);
+  assert(n>=0 && n<=TBPIECES);
 
   if (ptr->enc_type < 3) {
     if (pos[0] & 0x04) {

@@ -8,6 +8,7 @@ namespace Syzygy {
 static std::mutex tb_mutex;
 static bool tb_initialized = false;
 static std::string tb_current_path = "";
+static int tb_probe_limit = 7;
 
 static Move move_from_result(unsigned result) {
     unsigned promotes = TB_GET_PROMOTES(result);
@@ -78,12 +79,20 @@ int max_pieces() {
     return static_cast<int>(TB_LARGEST);
 }
 
+void set_probe_limit(int limit) {
+    tb_probe_limit = std::max(0, limit);
+}
+
+int probe_limit() {
+    return tb_probe_limit;
+}
+
 bool probe_wdl(const Board& board, Value& out_score, int ply) {
     if (TB_LARGEST == 0) return false;
     if (board.castling_rights() != 0) return false;
 
     int total_pieces = popcount(board.occupied_bb());
-    if (total_pieces > static_cast<int>(TB_LARGEST)) return false;
+    if (total_pieces > static_cast<int>(TB_LARGEST) || total_pieces > tb_probe_limit) return false;
 
     std::lock_guard<std::mutex> lock(tb_mutex);
 
@@ -129,7 +138,7 @@ bool probe_wdl(const Board& board, Value& out_score, int ply) {
 bool filter_root_moves(const Board& board, MoveList& root_moves, Value& out_score) {
     if (TB_LARGEST == 0 || board.castling_rights() != 0) return false;
     int total_pieces = popcount(board.occupied_bb());
-    if (total_pieces > static_cast<int>(TB_LARGEST)) return false;
+    if (total_pieces > static_cast<int>(TB_LARGEST) || total_pieces > tb_probe_limit) return false;
 
     std::lock_guard<std::mutex> lock(tb_mutex);
 
@@ -231,7 +240,7 @@ bool probe_root(const Board& board, Move& out_move, Value& out_score) {
     if (board.castling_rights() != 0) return false;
 
     int total_pieces = popcount(board.occupied_bb());
-    if (total_pieces > static_cast<int>(TB_LARGEST)) return false;
+    if (total_pieces > static_cast<int>(TB_LARGEST) || total_pieces > tb_probe_limit) return false;
 
     uint64_t white = board.color_bb(WHITE);
     uint64_t black = board.color_bb(BLACK);

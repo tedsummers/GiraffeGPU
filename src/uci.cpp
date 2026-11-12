@@ -42,6 +42,7 @@ void UCI::handle_uci() {
     std::cout << "option name ProbCutMargin type spin default 180 min 25 max 1000" << std::endl;
     std::cout << "option name MoveOverhead type spin default 30 min 0 max 1000" << std::endl;
     std::cout << "option name SyzygyPath type string default " << (syzygy_path_.empty() ? "<empty>" : syzygy_path_) << std::endl;
+    std::cout << "option name SyzygyProbeLimit type spin default " << Syzygy::probe_limit() << " min 0 max 7" << std::endl;
     std::cout << "option name WeightsFile type string default eval.net" << std::endl;
     std::cout << "uciok" << std::endl;
 }
@@ -127,6 +128,12 @@ void UCI::handle_setoption(const std::string& line) {
             g_search.set_syzygy_path(syzygy_path_);
             std::cout << "info string SyzygyPath set to " << syzygy_path_ << " (TB_LARGEST=" << Syzygy::max_pieces() << ")" << std::endl;
         }
+    } else if (opt_name == "SyzygyProbeLimit") {
+        try {
+            int limit = std::stoi(val_str);
+            Syzygy::set_probe_limit(limit);
+            std::cout << "info string SyzygyProbeLimit set to " << Syzygy::probe_limit() << std::endl;
+        } catch (...) {}
     } else if (opt_name == "WeightsFile") {
         weights_path_ = val_str;
         if (Neural::g_neural_gpu.is_initialized() && Neural::g_neural_gpu.load_weights(weights_path_)) {

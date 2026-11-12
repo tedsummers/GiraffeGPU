@@ -10,8 +10,12 @@ namespace Syzygy {
 // Initializes Syzygy tablebases from a directory path string
 bool init(const std::string& path);
 
-// Returns the max piece count of available tablebases (e.g., 5 or 6, or 0 if none)
+// Returns the max piece count of available tablebases (e.g., 5, 6, 7, or 0 if none)
 int max_pieces();
+
+// Sets and gets the Syzygy probe piece limit (default 7)
+void set_probe_limit(int limit);
+int probe_limit();
 
 // Probe WDL during search. Returns true if hit, writing WDL score to out_score.
 bool probe_wdl(const Board& board, Value& out_score, int ply);

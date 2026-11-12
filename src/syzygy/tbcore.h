@@ -56,12 +56,12 @@
 #define DTZSUFFIX ".rtbz"
 #define WDLDIR "RTBWDIR"
 #define DTZDIR "RTBZDIR"
-#define TBPIECES 6
+#define TBPIECES 7
 
 #define WDL_MAGIC 0x5d23e871
 #define DTZ_MAGIC 0xa50c66d7
 
-#define TBHASHBITS 10
+#define TBHASHBITS 12
 
 typedef unsigned long long uint64;
 typedef unsigned int uint32;
