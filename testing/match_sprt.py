@@ -272,7 +272,7 @@ def run_match(engine1_path, engine2_path, games=20, tc="60+0.5", book_path=None,
             damped_gain = max(15.0, min(45.0, raw_elo * 0.55 if raw_elo > 0 else 25.0))
             new_elo = float(prog_data.get("current_elo", 1850.0)) + damped_gain
             elo_tag = int(round(new_elo / 5.0) * 5)
-            evals_dir = os.path.join(repo_dir, "ratings_evals")
+            evals_dir = os.path.join(repo_dir, "rating_evals")
             os.makedirs(evals_dir, exist_ok=True)
             while os.path.exists(os.path.join(evals_dir, f"{elo_tag}_eval.net")) or os.path.exists(os.path.join(repo_dir, f"{elo_tag}_eval.net")):
                 elo_tag += 5
@@ -283,7 +283,7 @@ def run_match(engine1_path, engine2_path, games=20, tc="60+0.5", book_path=None,
             prog_data.setdefault("promotions", []).append({
                 "timestamp": datetime.now().isoformat(),
                 "elo_tag": elo_tag,
-                "checkpoint_file": f"ratings_evals/{elo_tag}_eval.net",
+                "checkpoint_file": f"rating_evals/{elo_tag}_eval.net",
                 "match_score": f"{wins}-{losses}-{draws}",
                 "raw_match_elo": round(raw_elo, 1),
                 "damped_elo_gain": round(damped_gain, 1),
