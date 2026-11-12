@@ -433,18 +433,18 @@ tail -f testing/results/autonomous.log
 python3 testing/autonomous_5day.py --stop
 ```
 
-#### Fault-Tolerance, State Persistence, & Elo-Tagged Checkpoints (`<elo>_eval.net`)
+#### Fault-Tolerance, State Persistence, & Historical Checkpoints (`ratings_evals/`)
 - **Resumable**: State is continuously persisted to `testing/results/autonomous_state.json`. If the machine restarts or the process is stopped, running `--daemon` or `--start` will automatically resume exactly where it left off.
-- **Automatic `<elo>_eval.net` Archiving on Promotion**: Whenever a candidate network wins an SPRT/LOS promotion match in either Phase 1 or Phase 2, [`testing/match_sprt.py`](file:///home/idiot/GiraffeGPU/testing/match_sprt.py#L248-L290) computes its Bayesian-damped Elo gain, updates the cumulative rating in `testing/results/elo_progression.json`, and saves a permanent copy of the promoted network in the repository root named `<elo>_eval.net`:
-  - [`orginal_eval.net`](file:///home/idiot/GiraffeGPU/orginal_eval.net) — Initial pre-training bootstrap network (`~1750 Elo`)
-  - [`1850_eval.net`](file:///home/idiot/GiraffeGPU/1850_eval.net) — Day 1 GPU-activated network (all 62/62 hidden `w3` neurons active + SPSA baseline, `~1850 Elo`)
-  - `1880_eval.net`, `1915_eval.net`, `1950_eval.net`, `2000_eval.net`, ... — Automatically saved each time a candidate network passes the SPRT/LOS promotion gate
+- **Dedicated Checkpoints Folder (`ratings_evals/`)**: Whenever a candidate network wins an SPRT/LOS promotion match in either Phase 1 or Phase 2, it is deployed to `eval.net` and **automatically archived in the `ratings_evals/` folder** named `ratings_evals/<elo>_eval.net`:
+  - [`ratings_evals/orginal_eval.net`](file:///home/idiot/GiraffeGPU/ratings_evals/orginal_eval.net) — Initial pre-training bootstrap network (`~1750 Elo`)
+  - [`ratings_evals/1850_eval.net`](file:///home/idiot/GiraffeGPU/ratings_evals/1850_eval.net) — Day 1 GPU-activated network (`~1850 Elo`)
+  - `ratings_evals/1895_eval.net`, `2010_eval.net`, `2105_eval.net`, `2135_eval.net`, ... — Automatically archived each time a network passes the promotion gate, with full match metadata logged in `testing/results/elo_progression.json`.
 - **Playing Against or Benchmarking Specific Elo Checkpoints**:
   ```bash
   # Load any historical Elo checkpoint via UCI or CuteChess:
   cutechess-cli \
     -engine cmd=./GiraffeGPU name=Giraffe_Latest option.WeightsFile=eval.net \
-    -engine cmd=./GiraffeGPU name=Giraffe_1850 option.WeightsFile=1850_eval.net \
+    -engine cmd=./GiraffeGPU name=Giraffe_2135 option.WeightsFile=ratings_evals/2135_eval.net \
     -each proto=uci tc=60+0.5 -rounds 10 -concurrency 2
   ```
 
