@@ -346,6 +346,7 @@ def main():
     parser.add_argument("--start", action="store_true", help="Start the 5-day autonomous optimization pipeline")
     parser.add_argument("--daemon", action="store_true", help="Launch in background as a daemon process")
     parser.add_argument("--status", action="store_true", help="Check live status of the running autonomous session")
+    parser.add_argument("--benchmarks", action="store_true", help="Display latest live Bratko-Kopec + Tactics benchmark results")
     parser.add_argument("--stop", action="store_true", help="Gracefully stop the running autonomous session")
     parser.add_argument("--test-run", action="store_true", help="Run a 15-minute smoke test of the pipeline at 60+0.5")
     parser.add_argument("--fresh", action="store_true", help="Archive saved state and start again from Day 1")
@@ -364,6 +365,9 @@ def main():
 
     if args.status:
         print_status()
+    elif args.benchmarks:
+        from watch_benchmarks import render_all
+        render_all()
     elif args.stop:
         stop_daemon()
     elif args.daemon:
